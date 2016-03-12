@@ -1,15 +1,17 @@
+
+
 // ----------------------------------------------------------------------------
 // Reflow Oven Controller
 // (c) 2014 Karl Pitrich <karl@pitrich.com>
 // (c) 2012-2013 Ed Simmons
 // ----------------------------------------------------------------------------
 
-//#define FAKE_HW 1
-//#define PIDTUNE 1 // autotune wouldn't fit in the 28k available on my arduino pro micro.
+// #define FAKE_HW 1
+// #define PIDTUNE 1 // autotune wouldn't fit in the 28k available on my arduino pro micro.
 
 // run a calibration loop that measures how many timer ticks occur between 2 zero corssings
 // FIXME: does not work reliably at the moment, so a oscilloscope-determined value is used.
-//#define WITH_CALIBRATION 1 // loop timing calibration
+// #define WITH_CALIBRATION 1 // loop timing calibration
 #define DEFAULT_LOOP_DELAY 89 // should be about 16% less for 60Hz mains
 
 #include <avr/eeprom.h>
@@ -21,17 +23,23 @@
 #include <Menu.h>
 #include <TimerOne.h>
 #include <ClickEncoder.h>
-#include "temperature.h"
+#include <max6675.h>
 #include "helpers.h"
-#ifdef FAKE_HW
-#include <TimerThree.h>
-#endif
+#include <FlexiTimer2.h>
+
+#define  TICK_PERIOD     10
+
+static int tickToTimeDivider = 1000 / TICK_PERIOD;
+
+#define  CYCLE_PERIOD    10  // TICK PERIODS
+#define  DISPLAY_PERIOD  25  // TICK PERIODS
+
 #ifdef PIDTUNE
 #include <PID_AutoTune_v0.h>
 #endif
 // ----------------------------------------------------------------------------
 
-const char * ver = "3.1";
+const char *ver = "4.0";
 
 // ----------------------------------------------------------------------------
 
@@ -42,27 +50,18 @@ const char * ver = "3.1";
 // Hardware Configuration 
 
 // 1.8" TFT via SPI -> breadboard
-#ifdef FAKE_HW
-#define LCD_CS  10
-#define LCD_DC   7
-#define LCD_RST  8
-#else 
-#define LCD_CS   10
-#define LCD_DC   9
-#define LCD_RST  8
-#endif
 
-// Thermocouple via SPI
-#define THERMOCOUPLE1_CS  3
+#define LCD_CS             10
+#define LCD_DC             8
+#define LCD_RST            9
 
-#define PIN_HEATER   0 // SSR for the heater
-#define PIN_FAN      1 // SSR for the fan
+// Thermocouple via S/W SPI
 
-#define PIN_ZX       2 // pin for zero crossing detector
-#define INT_ZX       1 // interrupt for zero crossing detector
-                       // Leonardo == Pro Micro:
-                       //   Pin: 3 2 0 1 7
-                       //   Int: 0 1 2 3 4 
+#define THERMOCOUPLE1_CS   4
+#define THERMOCOUPLE1_DO   5
+#define THERMOCOUPLE1_CLK  6
+
+#define PIN_HEATER         2 // SSR for the heater
 
 // ----------------------------------------------------------------------------
 
@@ -90,10 +89,10 @@ typedef struct profileValues_s {
 } Profile_t;
 
 Profile_t activeProfile; // the one and only instance
-int activeProfileId = 0;
+int       activeProfileId = 0;
 
-int idleTemp = 50; // the temperature at which to consider the oven safe to leave to cool naturally
-int fanAssistSpeed = 33; // default fan speed
+int       idleTemp       = 50; // the temperature at which to consider the oven safe to leave to cool naturally
+int       fanAssistSpeed = 33; // default fan speed
 
 const uint8_t maxProfiles = 30;
 
@@ -102,37 +101,61 @@ const uint16_t offsetFanSpeed   = maxProfiles * sizeof(Profile_t) + 1; // one by
 const uint16_t offsetProfileNum = maxProfiles * sizeof(Profile_t) + 2; // one byte
 const uint16_t offsetPidConfig  = maxProfiles * sizeof(Profile_t) + 3; // sizeof(PID_t)
 
+// ----------------------------------------------------------------------------
+
+struct Thermocouple {
+  double  temperature;
+  uint8_t stat;
+};
+
 Thermocouple A;
+
+MAX6675 sensor(THERMOCOUPLE1_CLK,
+               THERMOCOUPLE1_CS,
+               THERMOCOUPLE1_DO);
+
+// ----------------------------------------------------------------------------
+
+void readThermocouple(struct Thermocouple* input) {
+  double t;
+
+  t = sensor.readCelsius();
+  Serial.print("Temp= ");
+  Serial.println(t);
+
+  input->temperature = t;
+  
+  if (input->temperature == NAN) {
+    // uh oh, no thermocouple attached!
+    input->stat = 1;
+  }
+}
 
 // ----------------------------------------------------------------------------
 
 uint32_t startCycleZeroCrossTicks;
-uint32_t lastUpdate = 0;
+uint32_t lastUpdate        = 0;
 uint32_t lastDisplayUpdate = 0;
 
 // ----------------------------------------------------------------------------
 // UI
-
 // NB: Adafruit GFX ASCII-Table is bogous: https://github.com/adafruit/Adafruit-GFX-Library/issues/22
 //
+
 Adafruit_ST7735 tft = Adafruit_ST7735(LCD_CS, LCD_DC, LCD_RST);
 
-#ifdef FAKE_HW
-ClickEncoder Encoder(A0, A1, A2, 2);
-#else
-ClickEncoder Encoder(A1, A0, A2, 2);
-#endif
+ClickEncoder Encoder(A1, A0, A2, 4);
 
 Menu::Engine Engine;
 
-int16_t encMovement;
-int16_t encAbsolute;
-int16_t encLastAbsolute = -1;
+int16_t       encMovement;
+int16_t       encAbsolute;
+int16_t       encLastAbsolute = -1;
 
 const uint8_t menuItemsVisible = 5;
 const uint8_t menuItemHeight = 12;
-bool menuUpdateRequest = true;
-bool initialProcessDisplay = false;
+bool          menuUpdateRequest = true;
+bool          initialProcessDisplay = false;
 
 // ----------------------------------------------------------------------------
 // state machine
@@ -159,7 +182,7 @@ typedef enum {
 
 State currentState  = Idle;
 State previousState = Idle;
-bool stateChanged = false;
+bool stateChanged   = false;
 uint32_t stateChangedTicks = 0;
 
 // ----------------------------------------------------------------------------
@@ -173,6 +196,8 @@ typedef struct {
 
 LastItemState_t currentlyRenderedItems[menuItemsVisible];
 
+// ----------------------------------------------------------------------------
+
 void clearLastMenuItemRenderState() {
   // memset(&currentlyRenderedItems, 0xff, sizeof(LastItemState_t) * menuItemsVisible);
   for (uint8_t i = 0; i < menuItemsVisible; i++) {
@@ -184,10 +209,17 @@ void clearLastMenuItemRenderState() {
 
 // ----------------------------------------------------------------------------
 
-extern const Menu::Item_t miRampUpRate, miRampDnRate, miSoakTime, 
-                          miSoakTemp, miPeakTime, miPeakTemp,
-                          miLoadProfile, miSaveProfile,
-                          miPidSettingP, miPidSettingI, miPidSettingD,
+extern const Menu::Item_t miRampUpRate, 
+                          miRampDnRate, 
+                          miSoakTime, 
+                          miSoakTemp, 
+                          miPeakTime, 
+                          miPeakTemp,
+                          miLoadProfile, 
+                          miSaveProfile,
+                          miPidSettingP, 
+                          miPidSettingI, 
+                          miPidSettingD,
                           miFanSettings;
 
 // ----------------------------------------------------------------------------
@@ -196,9 +228,9 @@ extern const Menu::Item_t miRampUpRate, miRampDnRate, miSoakTime,
 uint8_t fanValue;
 uint8_t heaterValue;
 
-double Setpoint;
-double Input;
-double Output;
+double  Setpoint;
+double  Input;
+double  Output;
 
 typedef struct {
   double Kp;
@@ -225,8 +257,8 @@ unsigned int aTuneLookBack = 30;
 
 bool menuExit(const Menu::Action_t a) {
   clearLastMenuItemRenderState();
-  Engine.lastInvokedItem = &Menu::NullItem;
-  menuUpdateRequest = false;
+  Engine.lastInvokedItem  = &Menu::NullItem;
+  menuUpdateRequest       = false;
   return false;
 }
 
@@ -583,7 +615,7 @@ void setupRelayPins(void) {
 
 void killRelayPins(void) {
   Timer1.stop();
-  detachInterrupt(INT_ZX);
+  FlexiTimer2::stop();
   PORTD |= (1 << 2) | (1 << 3);
 }
 
@@ -605,9 +637,9 @@ typedef struct Channel_s {
 
 Channel_t Channels[CHANNELS] = {
   // heater
-  { 0, 0, 0, false, 2 }, // PD2 == RX == Arduino Pin 0
+  { 0, 0, 0, false, 2 }, // PD2 == Arduino Pin 3
   // fan
-  { 0, 0, 0, false, 3 }  // PD3 == TX == Arduino Pin 1
+  { 0, 0, 0, false, 3 }  // PD3 == Arduino Pin 2
 };
 
 // delay to align relay activation with the actual zero crossing
@@ -627,12 +659,13 @@ struct {
 // ----------------------------------------------------------------------------
 // Zero Crossing ISR; per ZX, process one channel per interrupt only
 // NB: use native port IO instead of digitalWrite for better performance
+
 void zeroCrossingIsr(void) {
   static uint8_t ch = 0;
 
   // reset phase control timer
-  phaseCounter = 0;
-  TCNT1 = 0;
+//  phaseCounter = 0;
+//  TCNT1 = 0;
 
   zeroCrossTicks++;
 
@@ -696,12 +729,14 @@ void timerIsr(void) { // ticks with 100µS
   }
 #endif
 }
-
 // ----------------------------------------------------------------------------
 
 void abortWithError(int error) {
   killRelayPins();
-
+  
+  Serial.print("Abort with error = ");
+  Serial.println(error);
+  
   tft.setTextColor(ST7735_WHITE, ST7735_RED);
   tft.fillScreen(ST7735_RED);
 
@@ -765,14 +800,16 @@ uint16_t pxPerS;
 uint16_t pxPerC;
 uint16_t xOffset; // used for wraparound on x axis
 
+// ----------------------------------------------------------------------------
+
 void updateProcessDisplay() {
   const uint8_t h =  86;
   const uint8_t w = 160;
   const uint8_t yOffset =  30; // space not available for graph  
 
   uint16_t dx, dy;
-  uint8_t y = 2;
-  double tmp;
+  uint8_t  y = 2;
+  double   tmp;
 
   // header & initial view
   tft.setTextColor(ST7735_WHITE, ST7735_BLUE);
@@ -823,7 +860,7 @@ void updateProcessDisplay() {
   }
 
   // elapsed time
-  uint16_t elapsed = (zeroCrossTicks - startCycleZeroCrossTicks) / 100;
+  uint16_t elapsed = (zeroCrossTicks - startCycleZeroCrossTicks) / tickToTimeDivider;
   tft.setCursor(125, y);
   alignRightPrefix(elapsed); 
   tft.print(elapsed);
@@ -916,6 +953,16 @@ void updateProcessDisplay() {
 
 void setup() {
   setupRelayPins();
+  
+  // setup /CS line for thermocouple
+  pinMode(THERMOCOUPLE1_CS, OUTPUT);
+  digitalWrite(THERMOCOUPLE1_CS, HIGH);
+
+  // setup /CS line for display
+  pinMode(LCD_CS, OUTPUT);
+  digitalWrite(LCD_CS, HIGH);
+
+  Serial.begin(57600);
 
   tft.initR(INITR_BLACKTAB);
   tft.setTextWrap(false);
@@ -935,15 +982,10 @@ void setup() {
 
   Timer1.initialize(100);
   Timer1.attachInterrupt(timerIsr);
-
-#ifndef FAKE_HW
-  pinMode(PIN_ZX, INPUT_PULLUP);
-  attachInterrupt(INT_ZX, zeroCrossingIsr, RISING);
+  Timer1.start();
+  FlexiTimer2::set(TICK_PERIOD, 1.0/1000.0, zeroCrossingIsr);
+  FlexiTimer2::start();
   delay(100);
-#else
-  Timer3.initialize(1000); // x10 speed
-  Timer3.attachInterrupt(zeroCrossingIsr);
-#endif
 
 #ifdef WITH_SPLASH
   // splash screen
@@ -955,21 +997,13 @@ void setup() {
   tft.setTextSize(1);
   tft.setCursor(52, 67);
   tft.print("v"); tft.print(ver);
-  #ifdef FAKE_HW
-  tft.print("-fake");
-  #endif
   tft.setCursor(7, 119);
   tft.print("(c)2014 karl@pitrich.com");
-  delay(1000);
+  delay(500);
 #endif
 
-  // setup /CS line for thermocouple and read initial temperature
-  A.chipSelect = THERMOCOUPLE1_CS;
-  pinMode(A.chipSelect, OUTPUT);
-  digitalWrite(A.chipSelect, HIGH);
-#ifndef FAKE_HW
   readThermocouple(&A);
-#endif
+
   if (A.stat != 0) {
     abortWithError(A.stat);
   }
@@ -1006,7 +1040,7 @@ void setup() {
   PID.SetOutputLimits(0, 100); // max output 100%
   PID.SetMode(AUTOMATIC);
 
-  delay(1000);
+  delay(500);
 
   menuExit(Menu::actionDisplay); // reset to initial state
   Engine.navigate(&miCycleStart);
@@ -1060,6 +1094,8 @@ void toggleAutoTune() {
 uint8_t thermocoupleErrorCount;
 #define TC_ERROR_TOLERANCE 5 // allow for n consecutive errors due to noisy power supply before bailing out
 
+// ----------------------------------------------------------------------------
+// MAIN LOOP
 // ----------------------------------------------------------------------------
 
 void loop(void) 
@@ -1137,15 +1173,12 @@ void loop(void)
 
   // --------------------------------------------------------------------------
 
-  if (zeroCrossTicks - lastUpdate >= 10) {
+  if (zeroCrossTicks - lastUpdate >= CYCLE_PERIOD) {
     uint32_t deltaT = zeroCrossTicks - lastUpdate;
     lastUpdate = zeroCrossTicks;
 
-#ifndef FAKE_HW
     readThermocouple(&A); // should be sufficient to read it every 250ms or 500ms
-#else
-    A.temperature = encAbsolute;
-#endif
+//    A.temperature = encAbsolute; // debug mode, use encoder
 
     if (A.stat > 0) {
       thermocoupleErrorCount++;
@@ -1191,7 +1224,7 @@ void loop(void)
     Input = airTemp[NUMREADINGS - 1].temp; // update the variable the PID reads
 
     // display update
-    if (zeroCrossTicks - lastDisplayUpdate > 50) {
+    if (zeroCrossTicks - lastDisplayUpdate > DISPLAY_PERIOD) {
       lastDisplayUpdate = zeroCrossTicks;
       if (currentState > UIMenuEnd) {
         updateProcessDisplay();
@@ -1335,15 +1368,15 @@ void loop(void)
       && currentState != Edit)
   {
     heaterValue = Output;
-    fanValue = fanAssistSpeed;
+    fanValue    = fanAssistSpeed;
   } 
   else {
     heaterValue = 0;
-    fanValue = Output;
+    fanValue    = Output;
   }
 #else
   heaterValue = Output;
-  fanValue = fanAssistSpeed;
+  fanValue    = fanAssistSpeed;
 #endif
 
   Channels[CHANNEL_HEATER].target = heaterValue;
@@ -1351,6 +1384,8 @@ void loop(void)
   double fanTmp = 90.0 / 100.0 * fanValue; // 0-100% -> 0-90° phase control
   Channels[CHANNEL_FAN].target = 90 - (uint8_t)fanTmp;
 }
+
+// ----------------------------------------------------------------------------
 
 void memoryFeedbackScreen(uint8_t profileId, bool loading) {
   tft.fillScreen(ST7735_GREEN);
@@ -1360,6 +1395,8 @@ void memoryFeedbackScreen(uint8_t profileId, bool loading) {
   tft.print(" profile ");
   tft.print(profileId);  
 }
+
+// ----------------------------------------------------------------------------
 
 void saveProfile(unsigned int targetProfile, bool quiet) {
 #ifndef PIDTUNE
@@ -1373,6 +1410,8 @@ void saveProfile(unsigned int targetProfile, bool quiet) {
   if (!quiet) delay(500);
 #endif
 }
+
+// ----------------------------------------------------------------------------
 
 void loadProfile(unsigned int targetProfile) {
   memoryFeedbackScreen(activeProfileId, true);
@@ -1395,6 +1434,8 @@ void loadProfile(unsigned int targetProfile) {
   delay(500);
 }
 
+// ----------------------------------------------------------------------------
+
 #define WITH_CHECKSUM 1
 
 bool saveParameters(uint8_t profile) {
@@ -1405,16 +1446,23 @@ bool saveParameters(uint8_t profile) {
   activeProfile.checksum = crc8((uint8_t *)&activeProfile, sizeof(Profile_t) - sizeof(uint8_t));
 #endif
 
-  do {} while (!(eeprom_is_ready()));
+  do {
+  } while (!(eeprom_is_ready()));
+  
   eeprom_write_block(&activeProfile, (void *)offset, sizeof(Profile_t));
 #endif
+  
   return true;
 }
+
+// ----------------------------------------------------------------------------
 
 bool loadParameters(uint8_t profile) {
   uint16_t offset = profile * sizeof(Profile_t);
 
-  do {} while (!(eeprom_is_ready()));
+  do {
+  } while (!(eeprom_is_ready()));
+  
   eeprom_read_block(&activeProfile, (void *)offset, sizeof(Profile_t));
 
 #ifdef WITH_CHECKSUM
@@ -1424,17 +1472,27 @@ bool loadParameters(uint8_t profile) {
 #endif
 }
 
+// ----------------------------------------------------------------------------
+
 bool savePID() {
-  do {} while (!(eeprom_is_ready()));
+  do {
+  } while (!(eeprom_is_ready()));
+  
   eeprom_write_block(&heaterPID, (void *)offsetPidConfig, sizeof(PID_t));
+  
   return true;
 }
 
 bool loadPID() {
-  do {} while (!(eeprom_is_ready()));
+  do {
+  } while (!(eeprom_is_ready()));
+  
   eeprom_read_block(&heaterPID, (void *)offsetPidConfig, sizeof(PID_t));
+  
   return true;  
 }
+
+// ----------------------------------------------------------------------------
 
 bool firstRun() { 
 #ifndef PIDTUNE
@@ -1450,6 +1508,8 @@ bool firstRun() {
   return true;
 }
 
+// ----------------------------------------------------------------------------
+
 void makeDefaultProfile() {
   activeProfile.soakTemp     = 130;
   activeProfile.soakDuration =  80;
@@ -1458,6 +1518,8 @@ void makeDefaultProfile() {
   activeProfile.rampUpRate   =   0.80;
   activeProfile.rampDownRate =   2.0;
 }
+
+// ----------------------------------------------------------------------------
 
 void factoryReset() {
 #ifndef PIDTUNE
@@ -1488,20 +1550,31 @@ void factoryReset() {
 #endif
 }
 
+// ----------------------------------------------------------------------------
+
 void saveFanSpeed() {
   EEPROM.write(offsetFanSpeed, (uint8_t)fanAssistSpeed & 0xff);
   delay(250);
 }
 
+// ----------------------------------------------------------------------------
+
 void loadFanSpeed() {
   fanAssistSpeed = EEPROM.read(offsetFanSpeed) & 0xff;
 }
+
+// ----------------------------------------------------------------------------
 
 void saveLastUsedProfile() {
   EEPROM.write(offsetProfileNum, (uint8_t)activeProfileId & 0xff);
 }
 
+// ----------------------------------------------------------------------------
+
 void loadLastUsedProfile() {
   activeProfileId = EEPROM.read(offsetProfileNum) & 0xff;
   loadParameters(activeProfileId);
 }
+
+// ----------------------------------------------------------------------------
+
