@@ -1,18 +1,27 @@
-
-
 // ----------------------------------------------------------------------------
 // Reflow Oven Controller
+// (c) 2016 Steve Smith
 // (c) 2014 Karl Pitrich <karl@pitrich.com>
 // (c) 2012-2013 Ed Simmons
 // ----------------------------------------------------------------------------
+//
+// Controller
+//
+// 128x160 LCD spi controller
+// rotary encoder/push button
+// MAX6675 K type thermocouple
+// SSR drive active low via transistor
+// Arduino 328P
+// ----------------------------------------------------------------------------
 
-// #define FAKE_HW 1
-// #define PIDTUNE 1 // autotune wouldn't fit in the 28k available on my arduino pro micro.
+const char *ver = "SRS 0.9a";
 
-// run a calibration loop that measures how many timer ticks occur between 2 zero corssings
-// FIXME: does not work reliably at the moment, so a oscilloscope-determined value is used.
-// #define WITH_CALIBRATION 1 // loop timing calibration
-#define DEFAULT_LOOP_DELAY 89 // should be about 16% less for 60Hz mains
+// ----------------------------------------------------------------------------
+
+// #define PIDTUNE 0 // 
+// #define DEBUG
+
+#define DEFAULT_LOOP_DELAY  80 // should be about 16% less for 60Hz mains
 
 #include <avr/eeprom.h>
 #include <EEPROM.h>
@@ -27,27 +36,18 @@
 #include "helpers.h"
 #include <FlexiTimer2.h>
 
-#define  TICK_PERIOD     10
-
-static int tickToTimeDivider = 1000 / TICK_PERIOD;
-
-#define  CYCLE_PERIOD    10  // TICK PERIODS
-#define  DISPLAY_PERIOD  25  // TICK PERIODS
-
 #ifdef PIDTUNE
 #include <PID_AutoTune_v0.h>
 #endif
-// ----------------------------------------------------------------------------
 
-const char *ver = "4.0";
-
-// ----------------------------------------------------------------------------
-
-#define MS_PER_SINE 100       // for 50Hz mains; 100ms per sinusoid
-//#define MS_PER_SINE  83.333 // for 60Hz Mains; 83,3333ms per sinusoid
+#define  TICK_PERIOD     10  //ms
+#define  CYCLE_PERIOD    10  // TICK PERIODS
+#define  DISPLAY_PERIOD  25  // TICK PERIODS
+static int ticksPerSec = 1000 / TICK_PERIOD;
 
 // ----------------------------------------------------------------------------
 // Hardware Configuration 
+// ----------------------------------------------------------------------------
 
 // 1.8" TFT via SPI -> breadboard
 
@@ -60,13 +60,11 @@ const char *ver = "4.0";
 #define THERMOCOUPLE1_CS   4
 #define THERMOCOUPLE1_DO   5
 #define THERMOCOUPLE1_CLK  6
-
 #define PIN_HEATER         2 // SSR for the heater
+#define PIN_FAN            3 // SSR for the heater
 
 // ----------------------------------------------------------------------------
-
 #define WITH_SPLASH 1
-
 // ----------------------------------------------------------------------------
 
 volatile uint32_t timerTicks     = 0;
@@ -120,9 +118,10 @@ void readThermocouple(struct Thermocouple* input) {
   double t;
 
   t = sensor.readCelsius();
+#ifdef DEBUG
   Serial.print("Temp= ");
   Serial.println(t);
-
+#endif
   input->temperature = t;
   
   if (input->temperature == NAN) {
@@ -143,19 +142,19 @@ uint32_t lastDisplayUpdate = 0;
 //
 
 Adafruit_ST7735 tft = Adafruit_ST7735(LCD_CS, LCD_DC, LCD_RST);
-
-ClickEncoder Encoder(A1, A0, A2, 4);
-
-Menu::Engine Engine;
+ClickEncoder    Encoder(A1, A0, A2, 4);
+Menu::Engine    Engine;
 
 int16_t       encMovement;
 int16_t       encAbsolute;
-int16_t       encLastAbsolute = -1;
-
-const uint8_t menuItemsVisible = 5;
-const uint8_t menuItemHeight = 12;
-bool          menuUpdateRequest = true;
+int16_t       encLastAbsolute       = -1;
+const uint8_t menuItemsVisible      = 8;
+const uint8_t menuItemHeight        = 12;
+bool          menuUpdateRequest     = true;
 bool          initialProcessDisplay = false;
+
+#define       PROMPT_Y 100
+#define       EXIT_Y   114
 
 // ----------------------------------------------------------------------------
 // state machine
@@ -180,18 +179,18 @@ typedef enum {
   Tune = 30
 } State;
 
-State currentState  = Idle;
-State previousState = Idle;
-bool stateChanged   = false;
-uint32_t stateChangedTicks = 0;
+State     currentState      = Idle;
+State     previousState     = Idle;
+bool      stateChanged      = false;
+uint32_t  stateChangedTicks = 0;
 
 // ----------------------------------------------------------------------------
 
-// track menu item state to improve render preformance
+// track menu item state to improve render performance
 typedef struct {
-  const Menu::Item_t *mi;
-  uint8_t pos;
-  bool current;
+  const Menu::Item_t  *mi;
+  uint8_t             pos;
+  bool                current;
 } LastItemState_t;
 
 LastItemState_t currentlyRenderedItems[menuItemsVisible];
@@ -199,10 +198,9 @@ LastItemState_t currentlyRenderedItems[menuItemsVisible];
 // ----------------------------------------------------------------------------
 
 void clearLastMenuItemRenderState() {
-  // memset(&currentlyRenderedItems, 0xff, sizeof(LastItemState_t) * menuItemsVisible);
   for (uint8_t i = 0; i < menuItemsVisible; i++) {
-    currentlyRenderedItems[i].mi = NULL;
-    currentlyRenderedItems[i].pos = 0xff;
+    currentlyRenderedItems[i].mi      = NULL;
+    currentlyRenderedItems[i].pos     = 0xff;
     currentlyRenderedItems[i].current = false;
   }
 }
@@ -227,7 +225,6 @@ extern const Menu::Item_t miRampUpRate,
 
 uint8_t fanValue;
 uint8_t heaterValue;
-
 double  Setpoint;
 double  Input;
 double  Output;
@@ -238,16 +235,17 @@ typedef struct {
   double Kd;
 } PID_t;
 
-PID_t heaterPID = { 4.00, 0.05,  2.00 };
+PID_t heaterPID = { 4.00, 0.00,  1.00 };
 PID_t fanPID    = { 1.00, 0.03, 10.00 };
 
 PID PID(&Input, &Output, &Setpoint, heaterPID.Kp, heaterPID.Ki, heaterPID.Kd, DIRECT);
 
 #ifdef PIDTUNE
+
 PID_ATune PIDTune(&Input, &Output);
 
 double aTuneStep       =  50,
-       aTuneNoise      =   1,
+       aTuneNoise      =   2,
        aTuneStartValue =  50; // is set to Output, i.e. 0-100% of Heater
 
 unsigned int aTuneLookBack = 30;
@@ -257,6 +255,7 @@ unsigned int aTuneLookBack = 30;
 
 bool menuExit(const Menu::Action_t a) {
   clearLastMenuItemRenderState();
+
   Engine.lastInvokedItem  = &Menu::NullItem;
   menuUpdateRequest       = false;
   return false;
@@ -344,7 +343,7 @@ bool editNumericalValue(const Menu::Action_t action) {
 
     if (initial) {
       tft.setTextColor(ST7735_BLACK, ST7735_WHITE);
-      tft.setCursor(10, 80);
+      tft.setCursor(10, EXIT_Y);
       tft.print("Edit & click to save.");
       Encoder.setAccelerationEnabled(true);
     }
@@ -399,7 +398,7 @@ bool editNumericalValue(const Menu::Action_t action) {
     Engine.lastInvokedItem = &Menu::NullItem;
 
 
-    if (currentState == Edit) { // leave edit mode, return to menu
+    if (currentState == Edit) { // leave edit mode, return to menu (
       if (isPidSetting(Engine.currentItem)) {
         savePID();
       }
@@ -427,9 +426,9 @@ bool factoryReset(const Menu::Action_t action) {
 
     if (initial) { // TODO: add eyecandy: colors or icons
       tft.setTextColor(ST7735_BLACK, ST7735_WHITE);
-      tft.setCursor(10, 80);
+      tft.setCursor(10, PROMPT_Y);
       tft.print("Click to confirm");
-      tft.setCursor(10, 90);
+      tft.setCursor(10, EXIT_Y);
       tft.print("Doubleclick to exit");
     }
   }
@@ -469,14 +468,14 @@ bool saveLoadProfile(const Menu::Action_t action) {
 
     if (initial) {
       encAbsolute = activeProfileId;      
-      tft.setCursor(10, 90);
+      tft.setCursor(10, EXIT_Y);
       tft.print("Doubleclick to exit");
     }
 
     if (encAbsolute > maxProfiles) encAbsolute = maxProfiles;
     if (encAbsolute <  0) encAbsolute =  0;
 
-    tft.setCursor(10, 80);
+    tft.setCursor(10, PROMPT_Y);
     tft.print("Click to ");
     tft.print((isLoad) ? "load " : "save ");
     tft.setTextColor(ST7735_WHITE, ST7735_RED);
@@ -524,7 +523,7 @@ bool cycleStart(const Menu::Action_t action) {
 // ----------------------------------------------------------------------------
 
 void renderMenuItem(const Menu::Item_t *mi, uint8_t pos) {
-  //ScopedTimer tm("  render menuitem");
+
   bool isCurrent = Engine.currentItem == mi;
   uint8_t y = pos * menuItemHeight + 2;
 
@@ -605,114 +604,82 @@ double averageT1 = 0;           // the average
 uint8_t index = 0;              // the index of the current reading
 
 // ----------------------------------------------------------------------------
-// Ensure that Solid State Relais are off when starting
+// Ensure that Solid State Relays are off when starting
 //
 void setupRelayPins(void) {
-  DDRD  |= (1 << 2) | (1 << 3); // output
-  //PORTD &= ~((1 << 2) | (1 << 3));
-  PORTD |= (1 << 2) | (1 << 3); // off
+  DDRD  |= (1 << PIN_HEATER) | (1 << PIN_FAN); // output
+  //PORTD &= ~((1 << PIN_HEATER) | (1 << PIN_FAN));
+  PORTD |= (1 << PIN_HEATER) | (1 << PIN_FAN); // off ACTIVE LOW
 }
 
 void killRelayPins(void) {
   Timer1.stop();
   FlexiTimer2::stop();
-  PORTD |= (1 << 2) | (1 << 3);
+  PORTD |= (1 << PIN_HEATER) | (1 << PIN_FAN);  // off ACTIVE LOW
 }
 
 // ----------------------------------------------------------------------------
 // wave packet control: only turn the solid state relais on for a percentage 
 // of complete sinusoids (i.e. 1x 360°)
 
-#define CHANNELS       2
 #define CHANNEL_HEATER 0
 #define CHANNEL_FAN    1
 
 typedef struct Channel_s {
   volatile uint8_t target; // percentage of on-time
-  uint8_t state;           // current state counter
-  int32_t next;            // when the next change in output shall occur  
-  bool action;             // hi/lo active
+  uint8_t          state;  // current state counter
+  int32_t          next;   // when the next change in output shall occur  
+  bool             action; // hi/lo active
   uint8_t pin;             // io pin of solid state relais
 } Channel_t;
 
-Channel_t Channels[CHANNELS] = {
-  // heater
-  { 0, 0, 0, false, 2 }, // PD2 == Arduino Pin 3
-  // fan
-  { 0, 0, 0, false, 3 }  // PD3 == Arduino Pin 2
-};
+Channel_t heaterChannel =   { 0, 0, 0, false, PIN_HEATER }; // PD2 == Arduino Pin 2
 
 // delay to align relay activation with the actual zero crossing
-uint16_t zxLoopDelay = 0;
-
-#ifdef WITH_CALIBRATION
-// calibrate zero crossing: how many timerIsr happen within one zero crossing
-#define zxCalibrationLoops 128
-struct {
-  volatile int8_t iterations;
-  volatile uint8_t measure[zxCalibrationLoops];
-} zxLoopCalibration = {
-  0, {}
-};
-#endif
+uint16_t zxLoopDelay;
 
 // ----------------------------------------------------------------------------
-// Zero Crossing ISR; per ZX, process one channel per interrupt only
-// NB: use native port IO instead of digitalWrite for better performance
+// Zero Crossing ISR
 
 void zeroCrossingIsr(void) {
-  static uint8_t ch = 0;
-
-  // reset phase control timer
-//  phaseCounter = 0;
-//  TCNT1 = 0;
-
   zeroCrossTicks++;
 
+  digitalWrite(18, HIGH);
   // calculate wave packet parameters
-  Channels[ch].state += Channels[ch].target;
-  if (Channels[ch].state >= 100) {
-    Channels[ch].state -= 100;
-    Channels[ch].action = false;
+  heaterChannel.state += heaterChannel.target;
+  if (heaterChannel.state >= 100) {
+    heaterChannel.state -= 100;
+    heaterChannel.action = false; // active LOW
   }
   else {
-    Channels[ch].action = true;
+    heaterChannel.action = true;
   }
-  Channels[ch].next = timerTicks + zxLoopDelay; // delay added to reach the next zx
-
-  ch = ((ch + 1) % CHANNELS); // next channel
-
-#ifdef WITH_CALIBRATION
-  if (zxLoopCalibration.iterations < zxCalibrationLoops) {
-    zxLoopCalibration.iterations++;
-  }
-#endif
+  heaterChannel.next = timerTicks + zxLoopDelay; // delay added to reach the next zx
+  digitalWrite(18, LOW);
 }
+
+
 
 // ----------------------------------------------------------------------------
 // timer interrupt handling
 
 void timerIsr(void) { // ticks with 100µS
+
   static uint32_t lastTicks = 0;
 
-  // phase control for the fan 
-  if (++phaseCounter > 90) {
-    phaseCounter = 0;
-  }
-
-  if (phaseCounter > Channels[CHANNEL_FAN].target) {
-    PORTD &= ~(1 << Channels[CHANNEL_FAN].pin);
-  }
-  else {
-    PORTD |=  (1 << Channels[CHANNEL_FAN].pin);
-  }
+  digitalWrite(19, HIGH);
+  digitalWrite(19, LOW);
 
   // wave packet control for heater
-  if (Channels[CHANNEL_HEATER].next > lastTicks // FIXME: this looses ticks when overflowing
-      && timerTicks > Channels[CHANNEL_HEATER].next) 
+  if (heaterChannel.next > lastTicks // FIXME: this looses ticks when overflowing
+      && timerTicks > heaterChannel.next) 
   {
-    if (Channels[CHANNEL_HEATER].action) PORTD |= (1 << Channels[CHANNEL_HEATER].pin);
-    else PORTD &= ~(1 << Channels[CHANNEL_HEATER].pin);
+    if (heaterChannel.action) {
+      PORTD |= (1 << heaterChannel.pin);
+    }
+    else {
+      PORTD &= ~(1 << heaterChannel.pin);
+    }
     lastTicks = timerTicks;
   }
 
@@ -720,22 +687,18 @@ void timerIsr(void) { // ticks with 100µS
   if (!(timerTicks % 10)) {
     Encoder.service();
   }
-
   timerTicks++;
 
-#ifdef WITH_CALIBRATION
-  if (zxLoopCalibration.iterations < zxCalibrationLoops) {
-    zxLoopCalibration.measure[zxLoopCalibration.iterations]++;
-  }
-#endif
 }
 // ----------------------------------------------------------------------------
 
 void abortWithError(int error) {
   killRelayPins();
   
+#ifdef DEBUG
   Serial.print("Abort with error = ");
   Serial.println(error);
+#endif
   
   tft.setTextColor(ST7735_WHITE, ST7735_RED);
   tft.fillScreen(ST7735_RED);
@@ -801,6 +764,10 @@ uint16_t pxPerC;
 uint16_t xOffset; // used for wraparound on x axis
 
 // ----------------------------------------------------------------------------
+// 
+// Refresh screen
+//
+// ----------------------------------------------------------------------------
 
 void updateProcessDisplay() {
   const uint8_t h =  86;
@@ -838,8 +805,12 @@ void updateProcessDisplay() {
     estimatedTotalTime += (activeProfile.peakTemp - activeProfile.soakTemp) / (activeProfile.rampUpRate / 10);
     estimatedTotalTime += (activeProfile.peakTemp - 20.0) / (activeProfile.rampDownRate  / 10);
     //estimatedTotalTime *= 2; // add some spare
+
+#ifdef DEBUG
     Serial.print("total est. time: ");
     Serial.println((uint16_t)estimatedTotalTime);
+#endif
+
 #endif
     tmp = 60 * 8;
     tmp = w / tmp * 10.0; 
@@ -852,15 +823,19 @@ void updateProcessDisplay() {
       tft.drawFastHLine(0, l, 160, tft.Color565(0xe0, 0xe0, 0xe0));
     }
 #ifdef GRAPH_VERBOSE
+
+#ifdef DEBUG
     Serial.print("Calc pxPerC/S: ");
     Serial.print(pxPerC);
     Serial.print("/");
     Serial.println(pxPerS);
 #endif
+
+#endif
   }
 
   // elapsed time
-  uint16_t elapsed = (zeroCrossTicks - startCycleZeroCrossTicks) / tickToTimeDivider;
+  uint16_t elapsed = (zeroCrossTicks - startCycleZeroCrossTicks) / ticksPerSec;
   tft.setCursor(125, y);
   alignRightPrefix(elapsed); 
   tft.print(elapsed);
@@ -962,6 +937,11 @@ void setup() {
   pinMode(LCD_CS, OUTPUT);
   digitalWrite(LCD_CS, HIGH);
 
+  pinMode(18, OUTPUT);
+  digitalWrite(18, LOW);
+  pinMode(19, OUTPUT);
+  digitalWrite(19, LOW);
+  
   Serial.begin(57600);
 
   tft.initR(INITR_BLACKTAB);
@@ -1014,25 +994,7 @@ void setup() {
     airTemp[i].temp = A.temperature;
   }
 
-#ifdef WITH_CALIBRATION
-  tft.setCursor(7, 99);  
-  tft.print("Calibrating... ");
-  delay(400);
-
-  // FIXME: does not work reliably
-  while (zxLoopDelay == 0) {
-    if (zxLoopCalibration.iterations == zxCalibrationLoops) { // average tick measurements, dump 1st value
-      for (int8_t l = 0; l < zxCalibrationLoops; l++) {
-        zxLoopDelay += zxLoopCalibration.measure[l];
-      }
-      zxLoopDelay /= zxCalibrationLoops;
-      zxLoopDelay -= 10; // compensating loop runtime
-    }
-  }
-  tft.print(zxLoopDelay);
-#else
   zxLoopDelay = DEFAULT_LOOP_DELAY;
-#endif
 
   loadFanSpeed();
   loadPID();
@@ -1063,9 +1025,9 @@ void setup() {
 uint32_t lastRampTicks;
 
 void updateRampSetpoint(bool down = false) {
-  if (zeroCrossTicks > lastRampTicks + MS_PER_SINE) {
+  if (zeroCrossTicks > lastRampTicks) {
     double rate = (down) ? activeProfile.rampDownRate : activeProfile.rampUpRate;
-    Setpoint += (rate / MS_PER_SINE * (zeroCrossTicks - lastRampTicks)) * ((down) ? -1 : 1);
+    Setpoint += (rate / ticksPerSec * (zeroCrossTicks - lastRampTicks)) * ((down) ? -1 : 1);
     lastRampTicks = zeroCrossTicks;
   }
 }
@@ -1102,7 +1064,8 @@ void loop(void)
 {
   // --------------------------------------------------------------------------
   // handle encoder
-  //
+  // --------------------------------------------------------------------------
+
   encMovement = Encoder.getValue();
   if (encMovement) {
     encAbsolute += encMovement;
@@ -1114,7 +1077,8 @@ void loop(void)
 
   // --------------------------------------------------------------------------
   // handle button
-  //
+  // --------------------------------------------------------------------------
+
   switch (Encoder.getButton()) {
     case ClickEncoder::Clicked:
       if (currentState == Complete) { // at end of cycle; reset at click
@@ -1144,7 +1108,8 @@ void loop(void)
 
   // --------------------------------------------------------------------------
   // update current menu item while in edit mode
-  //
+  // --------------------------------------------------------------------------
+
   if (currentState == Edit) {
     if (Engine.currentItem != &Menu::NullItem) {
       Engine.executeCallbackAction(Menu::actionDisplay);      
@@ -1153,7 +1118,8 @@ void loop(void)
 
   // --------------------------------------------------------------------------
   // handle menu update
-  //
+  // --------------------------------------------------------------------------
+
   if (menuUpdateRequest) {
     menuUpdateRequest = false;
     if (currentState < UIMenuEnd && !encMovement && currentState != Edit && previousState != Edit) { // clear menu on child/parent navigation
@@ -1164,7 +1130,8 @@ void loop(void)
 
   // --------------------------------------------------------------------------
   // track state changes
-  //
+  // --------------------------------------------------------------------------
+
   if (currentState != previousState) {
     stateChangedTicks = zeroCrossTicks;
     stateChanged = true;
@@ -1172,11 +1139,17 @@ void loop(void)
   }
 
   // --------------------------------------------------------------------------
+  // Controller cycle
+  // --------------------------------------------------------------------------
 
   if (zeroCrossTicks - lastUpdate >= CYCLE_PERIOD) {
     uint32_t deltaT = zeroCrossTicks - lastUpdate;
     lastUpdate = zeroCrossTicks;
 
+    // ------------------------------------------------------------------------
+    // Temperature
+    // ------------------------------------------------------------------------
+    
     readThermocouple(&A); // should be sufficient to read it every 250ms or 500ms
 //    A.temperature = encAbsolute; // debug mode, use encoder
 
@@ -1191,14 +1164,10 @@ void loop(void)
       abortWithError(A.stat);
     }
 
-#if 0 // verbose thermocouple error bits
-    tft.setCursor(10, 40);
-    for (uint8_t mask = B111; mask; mask >>= 1) {
-      tft.print(mask & A.stat ? '1' : '0');
-    }
-#endif
-      
+    // ------------------------------------------------------------------------
     // rolling average of the temp T1 and T2
+    // ------------------------------------------------------------------------
+
     totalT1 -= readingsT1[index];       // subtract the last reading
     readingsT1[index] = A.temperature;
     totalT1 += readingsT1[index];       // add the reading to the total
@@ -1214,12 +1183,15 @@ void loop(void)
     airTemp[NUMREADINGS - 1].temp = averageT1; // update the last index with the newest average
     airTemp[NUMREADINGS - 1].ticks = deltaT;
 
+    // ------------------------------------------------------------------------
     // calculate rate of temperature change
+    // ------------------------------------------------------------------------
+
     uint32_t collectTicks;
     for (int i = 0; i < NUMREADINGS; i++) {
       collectTicks += airTemp[i].ticks;
     }
-    rampRate = (airTemp[NUMREADINGS - 1].temp - airTemp[0].temp) / collectTicks * MS_PER_SINE;
+    rampRate = (airTemp[NUMREADINGS - 1].temp - airTemp[0].temp) / collectTicks * ticksPerSec;
 
     Input = airTemp[NUMREADINGS - 1].temp; // update the variable the PID reads
 
@@ -1231,13 +1203,22 @@ void loop(void)
       }
     }
 
+  // --------------------------------------------------------------------------
+  // State machine
+  // --------------------------------------------------------------------------
+
     switch (currentState) {
 #ifndef PIDTUNE
+
+      // ----------------------------------------------------------------------
+
       case RampToSoak:
         if (stateChanged) {
           lastRampTicks = zeroCrossTicks;
           stateChanged = false;
-          Output = 80;
+
+          Output = 80; // Percent
+
           PID.SetMode(AUTOMATIC);
           PID.SetControllerDirection(DIRECT);
           PID.SetTunings(heaterPID.Kp, heaterPID.Ki, heaterPID.Kd);
@@ -1246,10 +1227,16 @@ void loop(void)
 
         updateRampSetpoint();
 
+        // --------------------------------------------------------------------
+        // check if reached SOAK temperature
+        // --------------------------------------------------------------------
+
         if (Setpoint >= activeProfile.soakTemp - 1) {
           currentState = Soak;
         }
         break;
+
+      // ----------------------------------------------------------------------
 
       case Soak:
         if (stateChanged) {
@@ -1257,7 +1244,11 @@ void loop(void)
           Setpoint = activeProfile.soakTemp;
         }
 
-        if (zeroCrossTicks - stateChangedTicks >= (uint32_t)activeProfile.soakDuration * MS_PER_SINE) {
+        // --------------------------------------------------------------------
+        // check if SOAK finished
+        // --------------------------------------------------------------------
+
+        if (zeroCrossTicks - stateChangedTicks >= (uint32_t)activeProfile.soakDuration * ticksPerSec) {
           currentState = RampUp;
         }
         break;
@@ -1282,7 +1273,11 @@ void loop(void)
           Setpoint = activeProfile.peakTemp;
         }
 
-        if (zeroCrossTicks - stateChangedTicks >= (uint32_t)activeProfile.peakDuration * MS_PER_SINE) {
+        // --------------------------------------------------------------------
+        // check if PEAK finished
+        // --------------------------------------------------------------------
+
+        if (zeroCrossTicks - stateChangedTicks >= (uint32_t)activeProfile.peakDuration * ticksPerSec) {
           currentState = RampDown;
         }
         break;
@@ -1320,9 +1315,8 @@ void loop(void)
 #ifdef PIDTUNE
       case Tune:
         {
-          Setpoint = 210.0;
+          Setpoint = 160.0;
           int8_t val = PIDTune.Runtime();
-          PIDTune.setpoint = 210.0;
 
           if (val != 0) {
             currentState = CoolDown;
@@ -1379,10 +1373,7 @@ void loop(void)
   fanValue    = fanAssistSpeed;
 #endif
 
-  Channels[CHANNEL_HEATER].target = heaterValue;
-
-  double fanTmp = 90.0 / 100.0 * fanValue; // 0-100% -> 0-90° phase control
-  Channels[CHANNEL_FAN].target = 90 - (uint8_t)fanTmp;
+  heaterChannel.target = heaterValue;
 }
 
 // ----------------------------------------------------------------------------
