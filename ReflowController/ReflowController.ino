@@ -14,14 +14,14 @@
 // Arduino 328P
 // ----------------------------------------------------------------------------
 
-const char *ver = "SRS 0.9b";
+const char *ver = "SRS 0.9d";
 
 // ----------------------------------------------------------------------------
 
 // #define PIDTUNE 0 // 
 // #define DEBUG
 
-#define DEFAULT_LOOP_DELAY  80 // should be about 16% less for 60Hz mains
+#define DEFAULT_LOOP_DELAY  70 // should be about 16% less for 60Hz mains
 
 #include <avr/eeprom.h>
 #include <EEPROM.h>
@@ -41,8 +41,8 @@ const char *ver = "SRS 0.9b";
 #endif
 
 #define  TICK_PERIOD     10  //ms
-#define  CYCLE_PERIOD    10  // TICK PERIODS
-#define  DISPLAY_PERIOD  20  // TICK PERIODS
+#define  CYCLE_PERIOD    20  // TICK PERIODS
+#define  DISPLAY_PERIOD  40  // TICK PERIODS
 static int ticksPerSec = 1000 / TICK_PERIOD;
 
 // ----------------------------------------------------------------------------
@@ -51,16 +51,29 @@ static int ticksPerSec = 1000 / TICK_PERIOD;
 
 // 1.8" TFT via SPI -> breadboard
 
-#define LCD_CS             10
-#define LCD_DC             8
+#define LCD_CS             8
 #define LCD_RST            9
+#define LCD_DC             10
+#define LCD_SDA            11
+
+#define LCD_CLK            13
 
 // Thermocouple via S/W SPI
 
 #define THERMOCOUPLE1_CS   4
 #define THERMOCOUPLE1_DO   5
 #define THERMOCOUPLE1_CLK  6
+
 #define PIN_HEATER         2 // SSR for the heater
+
+
+// Rotary encoder with switch
+
+#define ENCODER_A          A0 // Common to GND
+#define ENCODER_B          A1
+#define ENCODER_SW         A2 // Common to GND
+
+#define ENCODER_CLICKS     4  // 
 
 // ----------------------------------------------------------------------------
 #define WITH_SPLASH 1
@@ -86,10 +99,10 @@ typedef struct profileValues_s {
 } Profile_t;
 
 Profile_t activeProfile; // the one and only instance
+
 int       activeProfileId = 0;
 
 int       idleTemp       = 50; // the temperature at which to consider the oven safe to leave to cool naturally
-
 
 const uint8_t maxProfiles = 30;
 
@@ -117,16 +130,18 @@ void readThermocouple(struct Thermocouple* input) {
   double t;
 
   t = sensor.readCelsius();
-#ifdef DEBUG
-  Serial.print("Temp= ");
-  Serial.println(t);
-#endif
   input->temperature = t;
   
-  if (input->temperature == NAN) {
+  if (isnan(t)) {
     // uh oh, no thermocouple attached!
     input->stat = 1;
   }
+#ifdef DEBUG
+  Serial.print("Temp=");
+  Serial.print(t);
+  Serial.print("   Stat=");
+  Serial.println(input->stat);
+#endif
 }
 
 // ----------------------------------------------------------------------------
@@ -141,14 +156,14 @@ uint32_t lastDisplayUpdate = 0;
 //
 
 Adafruit_ST7735 tft = Adafruit_ST7735(LCD_CS, LCD_DC, LCD_RST);
-ClickEncoder    Encoder(A1, A0, A2, 4);
+ClickEncoder    Encoder(ENCODER_A, ENCODER_B, ENCODER_SW, ENCODER_CLICKS);
 Menu::Engine    Engine;
 
 int16_t       encMovement;
 int16_t       encAbsolute;
 int16_t       encLastAbsolute       = -1;
 const uint8_t menuItemsVisible      = 8;
-const uint8_t menuItemHeight        = 12;
+const uint8_t menuItemHeight        = 14;
 bool          menuUpdateRequest     = true;
 bool          initialProcessDisplay = false;
 
@@ -576,7 +591,7 @@ MenuItem(miFactoryReset, "Factory Reset", Menu::NullItem, miPidSettings, miExit,
 
 // ----------------------------------------------------------------------------
 
-#define NUMREADINGS 4
+#define NUMREADINGS 3
 
 typedef struct {
   double temp;
@@ -626,9 +641,9 @@ uint16_t zxLoopDelay;
 // Zero Crossing ISR
 
 void zeroCrossingIsr(void) {
+
   zeroCrossTicks++;
 
-  digitalWrite(18, HIGH);
   // calculate wave packet parameters
   heaterChannel.state += heaterChannel.target;
   if (heaterChannel.state >= 100) {
@@ -639,7 +654,6 @@ void zeroCrossingIsr(void) {
     heaterChannel.action = true;
   }
   heaterChannel.next = timerTicks + zxLoopDelay; // delay added to reach the next zx
-  digitalWrite(18, LOW);
 }
 
 
@@ -650,9 +664,6 @@ void zeroCrossingIsr(void) {
 void timerIsr(void) { // ticks with 100µS
 
   static uint32_t lastTicks = 0;
-
-  digitalWrite(19, HIGH);
-  digitalWrite(19, LOW);
 
   // wave packet control for heater
   if (heaterChannel.next > lastTicks // FIXME: this looses ticks when overflowing
@@ -677,6 +688,7 @@ void timerIsr(void) { // ticks with 100µS
 // ----------------------------------------------------------------------------
 
 void abortWithError(int error) {
+
   killRelayPins();
   
 #ifdef DEBUG
@@ -685,6 +697,7 @@ void abortWithError(int error) {
 #endif
   
   tft.setTextColor(ST7735_WHITE, ST7735_RED);
+  
   tft.fillScreen(ST7735_RED);
 
   tft.setCursor(10, 10);
@@ -915,15 +928,10 @@ void setup() {
   // setup /CS line for display
   pinMode(LCD_CS, OUTPUT);
   digitalWrite(LCD_CS, HIGH);
-
-  pinMode(18, OUTPUT);
-  digitalWrite(18, LOW);
-  pinMode(19, OUTPUT);
-  digitalWrite(19, LOW);
   
   Serial.begin(57600);
 
-  tft.initR(INITR_BLACKTAB);
+  tft.initR(INITR_GREENTAB);
   tft.setTextWrap(false);
   tft.setTextSize(1);
   tft.setRotation(1);
@@ -958,7 +966,7 @@ void setup() {
   tft.print("v"); tft.print(ver);
   tft.setCursor(7, 119);
   tft.print("(c)2014 karl@pitrich.com");
-  delay(500);
+  delay(1000);
 #endif
 
   readThermocouple(&A);
@@ -979,7 +987,7 @@ void setup() {
   PID.SetOutputLimits(0, 100); // max output 100%
   PID.SetMode(AUTOMATIC);
 
-  delay(100);
+  delay(500);
 
   menuExit(Menu::actionDisplay); // reset to initial state
   Engine.navigate(&miCycleStart);
@@ -1031,7 +1039,7 @@ void toggleAutoTune() {
 // ----------------------------------------------------------------------------
 
 uint8_t thermocoupleErrorCount;
-#define TC_ERROR_TOLERANCE 5 // allow for n consecutive errors due to noisy power supply before bailing out
+#define TC_ERROR_TOLERANCE 1 // allow for n consecutive errors due to noisy power supply before bailing out
 
 // ----------------------------------------------------------------------------
 // MAIN LOOP
@@ -1129,7 +1137,7 @@ void loop(void)
     
     readThermocouple(&A); // should be sufficient to read it every 250ms or 500ms
 //    A.temperature = encAbsolute; // debug mode, use encoder
-
+  
     if (A.stat > 0) {
       thermocoupleErrorCount++;
     }
@@ -1137,7 +1145,7 @@ void loop(void)
       thermocoupleErrorCount = 0;
     }
 
-    if (thermocoupleErrorCount > TC_ERROR_TOLERANCE) {
+    if (thermocoupleErrorCount >= TC_ERROR_TOLERANCE) {
       abortWithError(A.stat);
     }
 
@@ -1476,7 +1484,7 @@ bool firstRun() {
 // ----------------------------------------------------------------------------
 
 void makeDefaultProfile() {
-  activeProfile.soakTemp     = 130;
+  activeProfile.soakTemp     = 150;
   activeProfile.soakDuration =  80;
   activeProfile.peakTemp     = 220;
   activeProfile.peakDuration =  40;
