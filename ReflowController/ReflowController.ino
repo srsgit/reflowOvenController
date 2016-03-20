@@ -14,7 +14,7 @@
 // Arduino 328P
 // ----------------------------------------------------------------------------
 
-const char *ver = "SRS 0.9a";
+const char *ver = "SRS 0.9b";
 
 // ----------------------------------------------------------------------------
 
@@ -42,7 +42,7 @@ const char *ver = "SRS 0.9a";
 
 #define  TICK_PERIOD     10  //ms
 #define  CYCLE_PERIOD    10  // TICK PERIODS
-#define  DISPLAY_PERIOD  25  // TICK PERIODS
+#define  DISPLAY_PERIOD  20  // TICK PERIODS
 static int ticksPerSec = 1000 / TICK_PERIOD;
 
 // ----------------------------------------------------------------------------
@@ -61,7 +61,6 @@ static int ticksPerSec = 1000 / TICK_PERIOD;
 #define THERMOCOUPLE1_DO   5
 #define THERMOCOUPLE1_CLK  6
 #define PIN_HEATER         2 // SSR for the heater
-#define PIN_FAN            3 // SSR for the heater
 
 // ----------------------------------------------------------------------------
 #define WITH_SPLASH 1
@@ -90,7 +89,7 @@ Profile_t activeProfile; // the one and only instance
 int       activeProfileId = 0;
 
 int       idleTemp       = 50; // the temperature at which to consider the oven safe to leave to cool naturally
-int       fanAssistSpeed = 33; // default fan speed
+
 
 const uint8_t maxProfiles = 30;
 
@@ -217,13 +216,11 @@ extern const Menu::Item_t miRampUpRate,
                           miSaveProfile,
                           miPidSettingP, 
                           miPidSettingI, 
-                          miPidSettingD,
-                          miFanSettings;
+                          miPidSettingD;
 
 // ----------------------------------------------------------------------------
 // PID
 
-uint8_t fanValue;
 uint8_t heaterValue;
 double  Setpoint;
 double  Input;
@@ -236,7 +233,7 @@ typedef struct {
 } PID_t;
 
 PID_t heaterPID = { 4.00, 0.00,  1.00 };
-PID_t fanPID    = { 1.00, 0.03, 10.00 };
+
 
 PID PID(&Input, &Output, &Setpoint, heaterPID.Kp, heaterPID.Ki, heaterPID.Kd, DIRECT);
 
@@ -286,7 +283,6 @@ void getItemValuePointer(const Menu::Item_t *mi, double **d, int16_t **i) {
   if (mi == &miPidSettingP) *d = &heaterPID.Kp;
   if (mi == &miPidSettingI) *d = &heaterPID.Ki;
   if (mi == &miPidSettingD) *d = &heaterPID.Kd; 
-  if (mi == &miFanSettings) *i = &fanAssistSpeed;
 }
 
 // ----------------------------------------------------------------------------
@@ -325,9 +321,6 @@ bool getItemValueLabel(const Menu::Item_t *mi, char *label) {
     }
     if (mi == &miPeakTime || mi == &miSoakTime) {
       itostr(label, *iValue, "s");
-    }
-    if (mi == &miFanSettings) {
-      itostr(label, *iValue, "%");
     }
   }
 
@@ -402,9 +395,7 @@ bool editNumericalValue(const Menu::Action_t action) {
       if (isPidSetting(Engine.currentItem)) {
         savePID();
       }
-      else if (Engine.currentItem == &miFanSettings) {
-        saveFanSpeed();
-      }
+      
       // don't autosave profile, so that one can do "save as" without overwriting the current profile
 
       currentState = Settings;
@@ -576,9 +567,8 @@ MenuItem(miEditProfile, "Edit Profile", miLoadProfile, miCycleStart,   miExit, m
   MenuItem(miPeakTime,   "Peak time", miRampDnRate,    miPeakTemp,     miEditProfile, Menu::NullItem, editNumericalValue);
   MenuItem(miRampDnRate, "Ramp down", Menu::NullItem,  miPeakTime,     miEditProfile, Menu::NullItem, editNumericalValue);
 MenuItem(miLoadProfile,  "Load Profile",  miSaveProfile,  miEditProfile, miExit, Menu::NullItem, saveLoadProfile);
-MenuItem(miSaveProfile,  "Save Profile",  miFanSettings,  miLoadProfile, miExit, Menu::NullItem, saveLoadProfile);
-MenuItem(miFanSettings,  "Fan Speed",  miPidSettings,  miSaveProfile, miExit, Menu::NullItem, editNumericalValue);
-MenuItem(miPidSettings,  "PID Settings",  miFactoryReset, miFanSettings, miExit, miPidSettingP,  menuDummy);
+MenuItem(miSaveProfile,  "Save Profile",  miPidSettings,  miLoadProfile, miExit, Menu::NullItem, saveLoadProfile);
+MenuItem(miPidSettings,  "PID Settings",  miFactoryReset, miSaveProfile, miExit, miPidSettingP,  menuDummy);
   MenuItem(miPidSettingP,  "Heater Kp",  miPidSettingI, Menu::NullItem, miPidSettings, Menu::NullItem, editNumericalValue);
   MenuItem(miPidSettingI,  "Heater Ki",  miPidSettingD, miPidSettingP,  miPidSettings, Menu::NullItem, editNumericalValue);
   MenuItem(miPidSettingD,  "Heater Kd",  Menu::NullItem, miPidSettingI, miPidSettings, Menu::NullItem, editNumericalValue);
@@ -586,7 +576,7 @@ MenuItem(miFactoryReset, "Factory Reset", Menu::NullItem, miPidSettings, miExit,
 
 // ----------------------------------------------------------------------------
 
-#define NUMREADINGS 10
+#define NUMREADINGS 4
 
 typedef struct {
   double temp;
@@ -596,9 +586,7 @@ typedef struct {
 Temp_t airTemp[NUMREADINGS];
 
 double readingsT1[NUMREADINGS]; // the readings used to make a stable temp rolling average
-double runningTotalRampRate;
-double rampRate = 0;
-double rateOfRise = 0;          // the result that is displayed
+double rampRate = 0;            // the result that is displayed
 double totalT1 = 0;             // the running total
 double averageT1 = 0;           // the average
 uint8_t index = 0;              // the index of the current reading
@@ -607,23 +595,19 @@ uint8_t index = 0;              // the index of the current reading
 // Ensure that Solid State Relays are off when starting
 //
 void setupRelayPins(void) {
-  DDRD  |= (1 << PIN_HEATER) | (1 << PIN_FAN); // output
-  //PORTD &= ~((1 << PIN_HEATER) | (1 << PIN_FAN));
-  PORTD |= (1 << PIN_HEATER) | (1 << PIN_FAN); // off ACTIVE LOW
+  DDRD  |= (1 << PIN_HEATER); // output
+  PORTD |= (1 << PIN_HEATER); // off ACTIVE LOW
 }
 
 void killRelayPins(void) {
   Timer1.stop();
   FlexiTimer2::stop();
-  PORTD |= (1 << PIN_HEATER) | (1 << PIN_FAN);  // off ACTIVE LOW
+  PORTD |= (1 << PIN_HEATER);  // off ACTIVE LOW
 }
 
 // ----------------------------------------------------------------------------
 // wave packet control: only turn the solid state relais on for a percentage 
 // of complete sinusoids (i.e. 1x 360°)
-
-#define CHANNEL_HEATER 0
-#define CHANNEL_FAN    1
 
 typedef struct Channel_s {
   volatile uint8_t target; // percentage of on-time
@@ -905,21 +889,16 @@ void updateProcessDisplay() {
   tft.drawPixel(dx, dy, ST7735_RED);
 
   // bottom line
-  y = 119;
+  y = 118;
 
   // set values
-  tft.setCursor(2, y);
+  tft.setCursor(10, y);
   tft.print("\xef");
   alignRightPrefix((int)heaterValue); 
   tft.print((int)heaterValue);
   tft.print('%');
 
-  tft.print(" \x2a");
-  alignRightPrefix((int)fanValue); 
-  tft.print((int)fanValue);
-  tft.print('%');
-
-  tft.print(" \x12 "); // alternative: \x7f
+  tft.print("     \x12 "); // alternative: \x7f
   printDouble(rampRate);
   tft.print("\367C/s    ");
 }
@@ -989,20 +968,18 @@ void setup() {
   }
 
   // initialize moving average filter
-  runningTotalRampRate = A.temperature * NUMREADINGS;
   for(int i = 0; i < NUMREADINGS; i++) {
     airTemp[i].temp = A.temperature;
   }
 
   zxLoopDelay = DEFAULT_LOOP_DELAY;
 
-  loadFanSpeed();
   loadPID();
 
   PID.SetOutputLimits(0, 100); // max output 100%
   PID.SetMode(AUTOMATIC);
 
-  delay(500);
+  delay(100);
 
   menuExit(Menu::actionDisplay); // reset to initial state
   Engine.navigate(&miCycleStart);
@@ -1168,11 +1145,11 @@ void loop(void)
     // rolling average of the temp T1 and T2
     // ------------------------------------------------------------------------
 
-    totalT1 -= readingsT1[index];       // subtract the last reading
+    totalT1           -= readingsT1[index];         // subtract the last reading
     readingsT1[index] = A.temperature;
-    totalT1 += readingsT1[index];       // add the reading to the total
-    index = (index + 1) % NUMREADINGS;  // next position
-    averageT1 = totalT1 / NUMREADINGS;  // calculate the average temp
+    totalT1           += A.temperature;             // add the reading to the total
+    index             = (index + 1) % NUMREADINGS;  // next position
+    averageT1         = totalT1 / NUMREADINGS;      // calculate the average temp
 
     // need to keep track of a few past readings in order to work out rate of rise
     for (int i = 1; i < NUMREADINGS; i++) { // iterate over all previous entries, moving them backwards one index
@@ -1191,7 +1168,7 @@ void loop(void)
     for (int i = 0; i < NUMREADINGS; i++) {
       collectTicks += airTemp[i].ticks;
     }
-    rampRate = (airTemp[NUMREADINGS - 1].temp - airTemp[0].temp) / collectTicks * ticksPerSec;
+    rampRate = ((airTemp[NUMREADINGS - 1].temp - airTemp[0].temp) / collectTicks) * ticksPerSec;
 
     Input = airTemp[NUMREADINGS - 1].temp; // update the variable the PID reads
 
@@ -1287,7 +1264,7 @@ void loop(void)
           stateChanged = false;
           lastRampTicks = zeroCrossTicks;
           PID.SetControllerDirection(REVERSE);
-          PID.SetTunings(fanPID.Kp, fanPID.Ki, fanPID.Kd);
+//          PID.SetTunings(fanPID.Kp, fanPID.Ki, fanPID.Kd);
           Setpoint = activeProfile.peakTemp - 15; // get it all going with a bit of a kick! v sluggish here otherwise, too hot too long
         }
 
@@ -1302,7 +1279,7 @@ void loop(void)
         if (stateChanged) {
           stateChanged = false;
           PID.SetControllerDirection(REVERSE);
-          PID.SetTunings(fanPID.Kp, fanPID.Ki, fanPID.Kd);
+//          PID.SetTunings(fanPID.Kp, fanPID.Ki, fanPID.Kd);
           Setpoint = idleTemp;
         }
 
@@ -1362,15 +1339,12 @@ void loop(void)
       && currentState != Edit)
   {
     heaterValue = Output;
-    fanValue    = fanAssistSpeed;
   } 
   else {
-    heaterValue = 0;
-    fanValue    = Output;
+    heaterValue = Output;
   }
 #else
   heaterValue = Output;
-  fanValue    = fanAssistSpeed;
 #endif
 
   heaterChannel.target = heaterValue;
@@ -1526,9 +1500,6 @@ void factoryReset() {
     saveParameters(i);
   }
 
-  fanAssistSpeed = 33;
-  saveFanSpeed();
-
   heaterPID.Kp =  0.60; 
   heaterPID.Ki =  0.01;
   heaterPID.Kd = 19.70;
@@ -1539,19 +1510,6 @@ void factoryReset() {
 
   delay(500);
 #endif
-}
-
-// ----------------------------------------------------------------------------
-
-void saveFanSpeed() {
-  EEPROM.write(offsetFanSpeed, (uint8_t)fanAssistSpeed & 0xff);
-  delay(250);
-}
-
-// ----------------------------------------------------------------------------
-
-void loadFanSpeed() {
-  fanAssistSpeed = EEPROM.read(offsetFanSpeed) & 0xff;
 }
 
 // ----------------------------------------------------------------------------
