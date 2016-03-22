@@ -10,11 +10,11 @@
 // 128x160 LCD spi controller
 // rotary encoder/push button
 // MAX6675 K type thermocouple
-// SSR drive active low via transistor
-// Arduino 328P
+// SSR drive active low
+// Arduino 328P UNO or Duemilanove
 // ----------------------------------------------------------------------------
 
-const char *ver = "SRS 0.9d";
+const char *ver = "SRS 0.9e";
 
 // ----------------------------------------------------------------------------
 
@@ -40,22 +40,22 @@ const char *ver = "SRS 0.9d";
 #include <PID_AutoTune_v0.h>
 #endif
 
-#define  TICK_PERIOD     10  //ms
-#define  CYCLE_PERIOD    20  // TICK PERIODS
-#define  DISPLAY_PERIOD  40  // TICK PERIODS
+#define  TICK_PERIOD       10   // xx ms for zero crossing ISR
+#define  CYCLE_PERIOD      10   // TICK PERIODS
+#define  DISPLAY_PERIOD    20   // TICK PERIODS
+
 static int ticksPerSec = 1000 / TICK_PERIOD;
 
 // ----------------------------------------------------------------------------
 // Hardware Configuration 
 // ----------------------------------------------------------------------------
 
-// 1.8" TFT via SPI -> breadboard
+// 1.8" TFT via SPI
 
 #define LCD_CS             8
 #define LCD_RST            9
 #define LCD_DC             10
 #define LCD_SDA            11
-
 #define LCD_CLK            13
 
 // Thermocouple via S/W SPI
@@ -65,7 +65,6 @@ static int ticksPerSec = 1000 / TICK_PERIOD;
 #define THERMOCOUPLE1_CLK  6
 
 #define PIN_HEATER         2 // SSR for the heater
-
 
 // Rotary encoder with switch
 
@@ -81,7 +80,6 @@ static int ticksPerSec = 1000 / TICK_PERIOD;
 
 volatile uint32_t timerTicks     = 0;
 volatile uint32_t zeroCrossTicks = 0;
-volatile uint8_t  phaseCounter   = 0;
 
 char buf[20]; // generic char buffer
 
@@ -101,8 +99,7 @@ typedef struct profileValues_s {
 Profile_t activeProfile; // the one and only instance
 
 int       activeProfileId = 0;
-
-int       idleTemp       = 50; // the temperature at which to consider the oven safe to leave to cool naturally
+int       idleTemp        = 50; // temperature at which to leave the oven to safely cool naturally
 
 const uint8_t maxProfiles = 30;
 
@@ -112,6 +109,14 @@ const uint16_t offsetProfileNum = maxProfiles * sizeof(Profile_t) + 2; // one by
 const uint16_t offsetPidConfig  = maxProfiles * sizeof(Profile_t) + 3; // sizeof(PID_t)
 
 // ----------------------------------------------------------------------------
+
+uint32_t startCycleZeroCrossTicks;
+uint32_t lastUpdate        = 0;
+uint32_t lastDisplayUpdate = 0;
+
+// ----------------------------------------------------------------------------
+
+double lastTemp = 0;
 
 struct Thermocouple {
   double  temperature;
@@ -124,6 +129,7 @@ MAX6675 sensor(THERMOCOUPLE1_CLK,
                THERMOCOUPLE1_CS,
                THERMOCOUPLE1_DO);
 
+
 // ----------------------------------------------------------------------------
 
 void readThermocouple(struct Thermocouple* input) {
@@ -135,7 +141,10 @@ void readThermocouple(struct Thermocouple* input) {
   if (isnan(t)) {
     // uh oh, no thermocouple attached!
     input->stat = 1;
+    input->temperature = lastTemp;
   }
+  lastTemp = input->temperature;
+
 #ifdef DEBUG
   Serial.print("Temp=");
   Serial.print(t);
@@ -143,12 +152,6 @@ void readThermocouple(struct Thermocouple* input) {
   Serial.println(input->stat);
 #endif
 }
-
-// ----------------------------------------------------------------------------
-
-uint32_t startCycleZeroCrossTicks;
-uint32_t lastUpdate        = 0;
-uint32_t lastDisplayUpdate = 0;
 
 // ----------------------------------------------------------------------------
 // UI
@@ -626,7 +629,8 @@ void killRelayPins(void) {
 
 typedef struct Channel_s {
   volatile uint8_t target; // percentage of on-time
-  uint8_t          state;  // current state counter
+//  uint8_t          state;  // current state counter
+  int32_t          startW;  // start of window (in zerocrossticks)
   int32_t          next;   // when the next change in output shall occur  
   bool             action; // hi/lo active
   uint8_t pin;             // io pin of solid state relais
@@ -644,19 +648,23 @@ void zeroCrossingIsr(void) {
 
   zeroCrossTicks++;
 
-  // calculate wave packet parameters
-  heaterChannel.state += heaterChannel.target;
-  if (heaterChannel.state >= 100) {
-    heaterChannel.state -= 100;
-    heaterChannel.action = false; // active LOW
+  // shift on/off window right
+  if ((zeroCrossTicks - heaterChannel.startW) > 100) {
+    heaterChannel.startW += 100;
   }
-  else {
-    heaterChannel.action = true;
+
+  // If active turn on for a number of interrupts until target reached then turn off for remainder
+
+  if (heaterChannel.target > 0) {
+    if ((zeroCrossTicks - heaterChannel.startW) <= heaterChannel.target) {
+      PORTD &= ~(1 << heaterChannel.pin); // less than target, turn on
+    } else {
+      PORTD |= (1 << heaterChannel.pin);  // greater than target, turn off
+    }
+  } else {
+    PORTD |= (1 << heaterChannel.pin);    // ZERO so turn off
   }
-  heaterChannel.next = timerTicks + zxLoopDelay; // delay added to reach the next zx
 }
-
-
 
 // ----------------------------------------------------------------------------
 // timer interrupt handling
@@ -665,26 +673,13 @@ void timerIsr(void) { // ticks with 100µS
 
   static uint32_t lastTicks = 0;
 
-  // wave packet control for heater
-  if (heaterChannel.next > lastTicks // FIXME: this looses ticks when overflowing
-      && timerTicks > heaterChannel.next) 
-  {
-    if (heaterChannel.action) {
-      PORTD |= (1 << heaterChannel.pin);
-    }
-    else {
-      PORTD &= ~(1 << heaterChannel.pin);
-    }
-    lastTicks = timerTicks;
-  }
-
   // handle encoder + button
   if (!(timerTicks % 10)) {
-    Encoder.service();
+    Encoder.service(); // needs to be called once per millisecond
   }
   timerTicks++;
-
 }
+
 // ----------------------------------------------------------------------------
 
 void abortWithError(int error) {
@@ -985,6 +980,7 @@ void setup() {
   loadPID();
 
   PID.SetOutputLimits(0, 100); // max output 100%
+  heaterChannel.startW = zeroCrossTicks;
   PID.SetMode(AUTOMATIC);
 
   delay(500);
@@ -1039,7 +1035,7 @@ void toggleAutoTune() {
 // ----------------------------------------------------------------------------
 
 uint8_t thermocoupleErrorCount;
-#define TC_ERROR_TOLERANCE 1 // allow for n consecutive errors due to noisy power supply before bailing out
+#define TC_ERROR_TOLERANCE 2 // allow for n consecutive errors due to noisy power supply before bailing out
 
 // ----------------------------------------------------------------------------
 // MAIN LOOP
@@ -1200,6 +1196,7 @@ void loop(void)
       case RampToSoak:
         if (stateChanged) {
           lastRampTicks = zeroCrossTicks;
+          heaterChannel.startW = zeroCrossTicks;
           stateChanged = false;
 
           Output = 80; // Percent
