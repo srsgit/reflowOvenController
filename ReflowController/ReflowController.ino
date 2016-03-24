@@ -14,7 +14,7 @@
 // Arduino 328P UNO or Duemilanove
 // ----------------------------------------------------------------------------
 
-const char *ver = "SRS 0.9e";
+const char *ver = "SRS 0.9f";
 
 // ----------------------------------------------------------------------------
 
@@ -45,6 +45,9 @@ const char *ver = "SRS 0.9e";
 #define  DISPLAY_PERIOD    20   // TICK PERIODS
 
 static int ticksPerSec = 1000 / TICK_PERIOD;
+
+#define  MAX_START_TEMP    50  // maximum temperature where a new reflow session will be allowed to start
+#define  NUM_PHASES         6  // number of phases in a profile
 
 // ----------------------------------------------------------------------------
 // Hardware Configuration 
@@ -84,8 +87,78 @@ volatile uint32_t zeroCrossTicks = 0;
 char buf[20]; // generic char buffer
 
 // ----------------------------------------------------------------------------
+// state machine
+
+typedef enum {
+  Phase1 = 0, // RampToSoak
+  Phase2,     // Soak
+  Phase3,     // RampUp
+  Phase4,     // Peak
+  Phase5,     // Rampdown
+  CoolDown,
+  Complete = 20,
+
+  None,     
+  Idle,
+  Settings,
+  Edit,
+
+  UIMenuEnd,
+  Tune = 30
+} State;
+
+State     currentState      = Idle;
+State     nextState         = Idle;
+State     previousState     = Idle;
+bool      stateChanged      = false;
+uint32_t  stateChangedTicks = 0;
+
+int       activeProfileId   = 1;
+int       idleTemp          = 40; // temperature at which to leave the oven to safely cool naturally
+
+struct ReflowPhase {
+  char*             Name;
+  int               StartTemperatureC;
+  int               ExitTemperatureC;
+  double            Rate;
+  int               ExitDurationS;
+  boolean           Rising;
+  State             NextState;
+};
+
+struct ReflowProfile {
+  char*       Name;
+  ReflowPhase Phases[NUM_PHASES];
+};
+
+
+ReflowProfile profiles[] = {
+  {"Leaded",
+    {  //   Zone      Start(C)  Exit(C)   Rate    Duration,   Rising
+      { "Pre-heat",   10,       150,      1.8,    120,        true,  Phase2},
+      { "Soak",       150,      185,      0.5,    90,         true,  Phase3},
+      { "Liquidus",   185,      215,      1.0,    40,         true,  Phase4},
+      { "Reflow",     215,      180,      5.0,    40,         false, Phase5},
+      { "Cool",       180,      50,       5.0,    180,        false, CoolDown},
+      { "Cooldown",   50,       30,       5.0,    180,        false, Complete}
+    },
+  },
+  {"Warm",
+    {  //   Zone      Start(C)  Exit(C)   Rate    Duration,   Rising
+      { "Pre-Warm",   10,       60,       1.8,    20,        true,  Phase2},
+      { "Warm",       60,       80,       0.5,    10,        true,  Phase3},
+      { "Warmer",     80,       90,       0.0,    30,        true,  Phase4},
+      { "Cooler",     80,       30,       5.0,    30,        false, Phase5},
+      { "Cold",       30,       20,       5.0,    30,        false, CoolDown},
+      { "Cooldown",   20,       20,       5.0,    10,        false, Complete}
+    }
+  }
+};
+
+#define NUM_PROFILES (sizeof(profiles)/sizeof(ReflowProfile)) //array size is computed from initialized data
 
 // data type for the values used in the reflow profile
+
 typedef struct profileValues_s {
   int16_t soakTemp;
   int16_t soakDuration;
@@ -98,8 +171,6 @@ typedef struct profileValues_s {
 
 Profile_t activeProfile; // the one and only instance
 
-int       activeProfileId = 0;
-int       idleTemp        = 50; // temperature at which to leave the oven to safely cool naturally
 
 const uint8_t maxProfiles = 30;
 
@@ -173,33 +244,6 @@ bool          initialProcessDisplay = false;
 #define       PROMPT_Y 100
 #define       EXIT_Y   114
 
-// ----------------------------------------------------------------------------
-// state machine
-
-typedef enum {
-  None     = 0,
-  Idle     = 1,
-  Settings = 2,
-  Edit     = 3,
-
-  UIMenuEnd = 9,
-
-  RampToSoak = 10,
-  Soak,
-  RampUp,
-  Peak,
-  RampDown,
-  CoolDown,
-
-  Complete = 20,
-
-  Tune = 30
-} State;
-
-State     currentState      = Idle;
-State     previousState     = Idle;
-bool      stateChanged      = false;
-uint32_t  stateChangedTicks = 0;
 
 // ----------------------------------------------------------------------------
 
@@ -518,7 +562,8 @@ bool cycleStart(const Menu::Action_t action) {
     menuExit(action);
 
 #ifndef PIDTUNE    
-    currentState = RampToSoak;
+    currentState = Phase1;
+    Serial.println("Enter Phase 1");
 #else
     toggleAutoTune();
 #endif
@@ -629,7 +674,6 @@ void killRelayPins(void) {
 
 typedef struct Channel_s {
   volatile uint8_t target; // percentage of on-time
-//  uint8_t          state;  // current state counter
   int32_t          startW;  // start of window (in zerocrossticks)
   int32_t          next;   // when the next change in output shall occur  
   bool             action; // hi/lo active
@@ -781,35 +825,20 @@ void updateProcessDisplay() {
     tft.setCursor(2, y);
 #ifndef PIDTUNE
     tft.print("Profile ");
-    tft.print(activeProfileId);
+    tft.print(profiles[activeProfileId].Name);
 #else
     tft.print("Tuning ");
 #endif
 
-    tmp = h / (activeProfile.peakTemp * 1.10) * 100.0;
+    tmp = h / ((uint16_t)profiles[activeProfileId].Phases[Phase3].ExitTemperatureC * 1.10) * 100.0;
     pxPerC = (uint16_t)tmp;
     
-#if 0 // pxPerS should be calculated from the selected profile, wint fit in flash right now
-    double estimatedTotalTime = 60 * 12;
-    // estimate total run time for current profile
-    estimatedTotalTime = activeProfile.soakDuration + activeProfile.peakDuration;
-    estimatedTotalTime += (activeProfile.soakTemp - 20.0) / (activeProfile.rampUpRate / 10);
-    estimatedTotalTime += (activeProfile.peakTemp - activeProfile.soakTemp) / (activeProfile.rampUpRate / 10);
-    estimatedTotalTime += (activeProfile.peakTemp - 20.0) / (activeProfile.rampDownRate  / 10);
-    //estimatedTotalTime *= 2; // add some spare
-
-#ifdef DEBUG
-    Serial.print("total est. time: ");
-    Serial.println((uint16_t)estimatedTotalTime);
-#endif
-
-#endif
-    tmp = 60 * 8;
+    tmp = 60 * 6;
     tmp = w / tmp * 10.0; 
     pxPerS = (uint16_t)tmp;
 
     // 50°C grid
-    int16_t t = (uint16_t)(activeProfile.peakTemp * 1.10);
+    int16_t t = (uint16_t)(profiles[activeProfileId].Phases[Phase3].ExitTemperatureC * 1.10);
     for (uint16_t tg = 0; tg < t; tg += 50) {
       uint16_t l = h - (tg * pxPerC / 100) + yOffset;
       tft.drawFastHLine(0, l, 160, tft.Color565(0xe0, 0xe0, 0xe0));
@@ -851,13 +880,16 @@ void updateProcessDisplay() {
   tft.setTextColor(ST7735_BLACK, ST7735_GREEN);
   
   switch (currentState) {
+    case Phase1:
+    case Phase2:
+    case Phase3:
+    case Phase4:
+    case Phase5:
+    case CoolDown:
+      tft.print(profiles[activeProfileId].Phases[currentState].Name);
+      break;
+      
     #define casePrintState(state) case state: tft.print(#state); break;
-    casePrintState(RampToSoak);
-    casePrintState(Soak);
-    casePrintState(RampUp);
-    casePrintState(Peak);
-    casePrintState(RampDown);
-    casePrintState(CoolDown);
     casePrintState(Complete);
     default: tft.print((uint8_t)currentState); break;
   }
@@ -1004,13 +1036,18 @@ void setup() {
 // ----------------------------------------------------------------------------
 
 uint32_t lastRampTicks;
+uint32_t debugCounter = 0;
 
-void updateRampSetpoint(bool down = false) {
+void updateRampSetpoint(double rate, bool rising) {
   if (zeroCrossTicks > lastRampTicks) {
-    double rate = (down) ? activeProfile.rampDownRate : activeProfile.rampUpRate;
-    Setpoint += (rate / ticksPerSec * (zeroCrossTicks - lastRampTicks)) * ((down) ? -1 : 1);
+    Setpoint += (rate / ticksPerSec * (zeroCrossTicks - lastRampTicks)) * (rising ? 1 : -1);
     lastRampTicks = zeroCrossTicks;
   }
+  if ((debugCounter % 10) == 0) {
+    Serial.print("update ramp: ");
+    Serial.println(Setpoint);
+  }
+  debugCounter++;
 }
 
 // ----------------------------------------------------------------------------
@@ -1068,12 +1105,12 @@ void loop(void)
         currentState = Settings;
         menuUpdateRequest = true;
       }
-      else if (currentState < UIMenuEnd) {
+      else if (currentState > Complete) {
         menuUpdateRequest = true;
         Engine.invoke();
       }
-      else if (currentState > UIMenuEnd) {
-        currentState = CoolDown;
+      else if (currentState < Complete) {
+        currentState = Phase5;
       }
       break;
 
@@ -1179,7 +1216,7 @@ void loop(void)
     // display update
     if (zeroCrossTicks - lastDisplayUpdate > DISPLAY_PERIOD) {
       lastDisplayUpdate = zeroCrossTicks;
-      if (currentState > UIMenuEnd) {
+      if (currentState < None) {
         updateProcessDisplay();
       }
     }
@@ -1193,106 +1230,53 @@ void loop(void)
 
       // ----------------------------------------------------------------------
 
-      case RampToSoak:
-        if (stateChanged) {
-          lastRampTicks = zeroCrossTicks;
-          heaterChannel.startW = zeroCrossTicks;
-          stateChanged = false;
-
+      case Phase1:
           Output = 80; // Percent
+
+      case Phase2: //Soak
+      case Phase3: //Rampup
+      case Phase4: //Peak
+      case Phase5: //Rampdown
+      case CoolDown:
+
+        if (stateChanged) {
+
+          Serial.print("New state ");
+          Serial.println(currentState);
+          
+          lastRampTicks = zeroCrossTicks;
+          stateChanged = false;
+          heaterChannel.startW = zeroCrossTicks;
+          Setpoint = profiles[activeProfileId].Phases[currentState].StartTemperatureC;
 
           PID.SetMode(AUTOMATIC);
           PID.SetControllerDirection(DIRECT);
           PID.SetTunings(heaterPID.Kp, heaterPID.Ki, heaterPID.Kd);
-          Setpoint = airTemp[NUMREADINGS - 1].temp;
         }
 
-        updateRampSetpoint();
+        updateRampSetpoint(profiles[activeProfileId].Phases[currentState].Rate,
+                           profiles[activeProfileId].Phases[currentState].Rising);
 
         // --------------------------------------------------------------------
-        // check if reached SOAK temperature
+        // check if Phase end temperature reached
+        // check if Phase time complete
         // --------------------------------------------------------------------
 
-        if (Setpoint >= activeProfile.soakTemp - 1) {
-          currentState = Soak;
+        nextState = currentState;
+        if (Setpoint >= profiles[activeProfileId].Phases[currentState].ExitTemperatureC) {
+          nextState = profiles[activeProfileId].Phases[currentState].NextState;
+          Serial.println("End state (temp reached) ");
         }
+
+        if ((zeroCrossTicks - stateChangedTicks) >= (uint32_t)profiles[activeProfileId].Phases[currentState].ExitDurationS * ticksPerSec) {
+          nextState = profiles[activeProfileId].Phases[currentState].NextState;
+          Serial.println("End state (time reached) ");
+        }
+
+        currentState = nextState;
         break;
 
-      // ----------------------------------------------------------------------
-
-      case Soak:
-        if (stateChanged) {
-          stateChanged = false;
-          Setpoint = activeProfile.soakTemp;
-        }
-
-        // --------------------------------------------------------------------
-        // check if SOAK finished
-        // --------------------------------------------------------------------
-
-        if (zeroCrossTicks - stateChangedTicks >= (uint32_t)activeProfile.soakDuration * ticksPerSec) {
-          currentState = RampUp;
-        }
-        break;
-
-      case RampUp:
-        if (stateChanged) {
-          stateChanged = false;
-          lastRampTicks = zeroCrossTicks;
-        }
-
-        updateRampSetpoint();
-
-        if (Setpoint >= activeProfile.peakTemp - 1) {
-          Setpoint = activeProfile.peakTemp;
-          currentState = Peak;
-        }
-        break;
-
-      case Peak:
-        if (stateChanged) {
-          stateChanged = false;
-          Setpoint = activeProfile.peakTemp;
-        }
-
-        // --------------------------------------------------------------------
-        // check if PEAK finished
-        // --------------------------------------------------------------------
-
-        if (zeroCrossTicks - stateChangedTicks >= (uint32_t)activeProfile.peakDuration * ticksPerSec) {
-          currentState = RampDown;
-        }
-        break;
-
-      case RampDown:
-        if (stateChanged) {
-          stateChanged = false;
-          lastRampTicks = zeroCrossTicks;
-          PID.SetControllerDirection(REVERSE);
-//          PID.SetTunings(fanPID.Kp, fanPID.Ki, fanPID.Kd);
-          Setpoint = activeProfile.peakTemp - 15; // get it all going with a bit of a kick! v sluggish here otherwise, too hot too long
-        }
-
-        updateRampSetpoint(true);
-
-        if (Setpoint <= idleTemp) {
-          currentState = CoolDown;
-        }
-        break;
 #endif
-      case CoolDown:
-        if (stateChanged) {
-          stateChanged = false;
-          PID.SetControllerDirection(REVERSE);
-//          PID.SetTunings(fanPID.Kp, fanPID.Ki, fanPID.Kd);
-          Setpoint = idleTemp;
-        }
-
-        if (Input < (idleTemp + 5)) {
-          currentState = Complete;
-          PID.SetMode(MANUAL);
-          Output = 0;
-        }
 
 #ifdef PIDTUNE
       case Tune:
@@ -1331,26 +1315,8 @@ void loop(void)
   //if (Setpoint > Input + 50) abortWithError(10); // if we're 50 degree cooler than setpoint, abort
   //if (Input > Setpoint + 50) abortWithError(20); // or 50 degrees hotter, also abort
   
-#ifndef PIDTUNE
   PID.Compute();
-
-  // decides which control signal is fed to the output for this cycle
-  if (   currentState != RampDown
-      && currentState != CoolDown
-      && currentState != Settings
-      && currentState != Complete
-      && currentState != Idle
-      && currentState != Settings
-      && currentState != Edit)
-  {
-    heaterValue = Output;
-  } 
-  else {
-    heaterValue = Output;
-  }
-#else
   heaterValue = Output;
-#endif
 
   heaterChannel.target = heaterValue;
 }
