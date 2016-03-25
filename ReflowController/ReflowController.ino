@@ -47,7 +47,7 @@ const char *ver = "SRS 0.9f";
 static int ticksPerSec = 1000 / TICK_PERIOD;
 
 #define  MAX_START_TEMP    50  // maximum temperature where a new reflow session will be allowed to start
-#define  NUM_PHASES         6  // number of phases in a profile
+#define  NUM_PHASES         5  // number of phases in a profile
 
 // ----------------------------------------------------------------------------
 // Hardware Configuration 
@@ -84,6 +84,8 @@ static int ticksPerSec = 1000 / TICK_PERIOD;
 volatile uint32_t timerTicks     = 0;
 volatile uint32_t zeroCrossTicks = 0;
 
+const uint8_t     maxProfiles = 8;
+
 char buf[20]; // generic char buffer
 
 // ----------------------------------------------------------------------------
@@ -113,71 +115,41 @@ State     previousState     = Idle;
 bool      stateChanged      = false;
 uint32_t  stateChangedTicks = 0;
 
-int       activeProfileId   = 1;
-int       idleTemp          = 40; // temperature at which to leave the oven to safely cool naturally
+int       activeProfileId   = 0;
+int       idleTemp          = 50; // temperature at which to leave the oven to safely cool naturally
 
 struct ReflowPhase {
-  char*             Name;
-  int               StartTemperatureC;
-  int               ExitTemperatureC;
-  double            Rate;
-  int               ExitDurationS;
-  boolean           Rising;
-  State             NextState;
+  char    Name[15];
+  int     StartTemperatureC;
+  int     ExitTemperatureC;
+  double  Rate;
+  int     ExitDurationS;
+  boolean Rising;
+  State   NextState;
 };
 
 struct ReflowProfile {
-  char*       Name;
+  char        Name[15];
   ReflowPhase Phases[NUM_PHASES];
+  uint8_t     checksum;
 };
 
+ReflowProfile activeProfile;
 
-ReflowProfile profiles[] = {
-  {"Leaded",
-    {  //   Zone      Start(C)  Exit(C)   Rate    Duration,   Rising
-      { "Pre-heat",   10,       150,      1.8,    120,        true,  Phase2},
-      { "Soak",       150,      185,      0.5,    90,         true,  Phase3},
-      { "Liquidus",   185,      215,      1.0,    40,         true,  Phase4},
-      { "Reflow",     215,      180,      5.0,    40,         false, Phase5},
-      { "Cool",       180,      50,       5.0,    180,        false, CoolDown},
-      { "Cooldown",   50,       30,       5.0,    180,        false, Complete}
-    },
-  },
-  {"Warm",
-    {  //   Zone      Start(C)  Exit(C)   Rate    Duration,   Rising
-      { "Pre-Warm",   10,       60,       1.8,    20,        true,  Phase2},
-      { "Warm",       60,       80,       0.5,    10,        true,  Phase3},
-      { "Warmer",     80,       90,       0.0,    30,        true,  Phase4},
-      { "Cooler",     80,       30,       5.0,    30,        false, Phase5},
-      { "Cold",       30,       20,       5.0,    30,        false, CoolDown},
-      { "Cooldown",   20,       20,       5.0,    10,        false, Complete}
-    }
+ReflowProfile defaultProfile = 
+{"Leaded",
+  {// Zone         Start(C)   Exit(C)   Rate    Duration,   Rising Next
+    { "Pre-heat",    60,      150,      1.5,    120,        true,  Phase2},
+    { "Soak",       150,      180,      0.8,     45,        true,  Phase3},
+    { "ReflowPeak", 225,      250,      0.0,     40,        true,  Phase4},
+    { "ReflowCool", 180,      150,      1.5,     30,        false, Phase5},
+    { "Cool",       150,       40,      2.0,    180,        false, CoolDown},
   }
 };
 
-#define NUM_PROFILES (sizeof(profiles)/sizeof(ReflowProfile)) //array size is computed from initialized data
-
-// data type for the values used in the reflow profile
-
-typedef struct profileValues_s {
-  int16_t soakTemp;
-  int16_t soakDuration;
-  int16_t peakTemp;
-  int16_t peakDuration;
-  double  rampUpRate;
-  double  rampDownRate;
-  uint8_t checksum;
-} Profile_t;
-
-Profile_t activeProfile; // the one and only instance
-
-
-const uint8_t maxProfiles = 30;
-
 // EEPROM offsets
-const uint16_t offsetFanSpeed   = maxProfiles * sizeof(Profile_t) + 1; // one byte
-const uint16_t offsetProfileNum = maxProfiles * sizeof(Profile_t) + 2; // one byte
-const uint16_t offsetPidConfig  = maxProfiles * sizeof(Profile_t) + 3; // sizeof(PID_t)
+const uint16_t offsetProfileNum = maxProfiles * sizeof(ReflowProfile) + 2; // one byte
+const uint16_t offsetPidConfig  = maxProfiles * sizeof(ReflowProfile) + 3; // sizeof(PID_t)
 
 // ----------------------------------------------------------------------------
 
@@ -294,7 +266,7 @@ typedef struct {
   double Kd;
 } PID_t;
 
-PID_t heaterPID = { 4.00, 0.00,  1.00 };
+PID_t heaterPID = { 30.00, 0.00,  5.00 };
 
 
 PID PID(&Input, &Output, &Setpoint, heaterPID.Kp, heaterPID.Ki, heaterPID.Kd, DIRECT);
@@ -336,12 +308,12 @@ void printDouble(double val, uint8_t precision = 1) {
 // ----------------------------------------------------------------------------
 
 void getItemValuePointer(const Menu::Item_t *mi, double **d, int16_t **i) {
-  if (mi == &miRampUpRate)  *d = &activeProfile.rampUpRate;
-  if (mi == &miRampDnRate)  *d = &activeProfile.rampDownRate;
-  if (mi == &miSoakTime)    *i = &activeProfile.soakDuration;
-  if (mi == &miSoakTemp)    *i = &activeProfile.soakTemp;
-  if (mi == &miPeakTime)    *i = &activeProfile.peakDuration;
-  if (mi == &miPeakTemp)    *i = &activeProfile.peakTemp;
+//  if (mi == &miRampUpRate)  *d = &activeProfile.rampUpRate;
+//  if (mi == &miRampDnRate)  *d = &activeProfile.rampDownRate;
+//  if (mi == &miSoakTime)    *i = &activeProfile.soakDuration;
+//  if (mi == &miSoakTemp)    *i = &activeProfile.soakTemp;
+//  if (mi == &miPeakTime)    *i = &activeProfile.peakDuration;
+//  if (mi == &miPeakTemp)    *i = &activeProfile.peakTemp;
   if (mi == &miPidSettingP) *d = &heaterPID.Kp;
   if (mi == &miPidSettingI) *d = &heaterPID.Ki;
   if (mi == &miPidSettingD) *d = &heaterPID.Kd; 
@@ -354,7 +326,7 @@ bool isPidSetting(const Menu::Item_t *mi) {
 }
 
 bool isRampSetting(const Menu::Item_t *mi) {
-  return mi == &miRampUpRate || mi == &miRampDnRate;
+//  return mi == &miRampUpRate || mi == &miRampDnRate;
 }
 
 // ----------------------------------------------------------------------------
@@ -377,14 +349,14 @@ bool getItemValueLabel(const Menu::Item_t *mi, char *label) {
       *p = '\0';
     }
   }
-  else {
-    if (mi == &miPeakTemp || mi == &miSoakTemp) {
-      itostr(label, *iValue, "\367C");
-    }
-    if (mi == &miPeakTime || mi == &miSoakTime) {
-      itostr(label, *iValue, "s");
-    }
-  }
+ // else {
+ //   if (mi == &miPeakTemp || mi == &miSoakTemp) {
+ //     itostr(label, *iValue, "\367C");
+ //   }
+ //   if (mi == &miPeakTime || mi == &miSoakTime) {
+ //     itostr(label, *iValue, "s");
+ //   }
+ // }
 
   return dValue || iValue;
 }
@@ -618,18 +590,18 @@ void renderMenuItem(const Menu::Item_t *mi, uint8_t pos) {
 MenuItem(miExit, "", Menu::NullItem, Menu::NullItem, Menu::NullItem, miCycleStart, menuExit);
 
 #ifndef PIDTUNE
-MenuItem(miCycleStart,  "Start Cycle",  miEditProfile, Menu::NullItem, miExit, Menu::NullItem, cycleStart);
+MenuItem(miCycleStart,  "Start Cycle",  miLoadProfile, Menu::NullItem, miExit, Menu::NullItem, cycleStart);
 #else
-MenuItem(miCycleStart,  "Start Autotune",  miEditProfile, Menu::NullItem, miExit, Menu::NullItem, cycleStart);
+MenuItem(miCycleStart,  "Start Autotune",  miPidSettings, Menu::NullItem, miExit, Menu::NullItem, cycleStart);
 #endif
-MenuItem(miEditProfile, "Edit Profile", miLoadProfile, miCycleStart,   miExit, miRampUpRate, menuDummy);
-  MenuItem(miRampUpRate, "Ramp up  ",   miSoakTemp,      Menu::NullItem, miEditProfile, Menu::NullItem, editNumericalValue);
-  MenuItem(miSoakTemp,   "Soak temp", miSoakTime,      miRampUpRate,   miEditProfile, Menu::NullItem, editNumericalValue);
-  MenuItem(miSoakTime,   "Soak time", miPeakTemp,      miSoakTemp,     miEditProfile, Menu::NullItem, editNumericalValue);
-  MenuItem(miPeakTemp,   "Peak temp", miPeakTime,      miSoakTime,     miEditProfile, Menu::NullItem, editNumericalValue);
-  MenuItem(miPeakTime,   "Peak time", miRampDnRate,    miPeakTemp,     miEditProfile, Menu::NullItem, editNumericalValue);
-  MenuItem(miRampDnRate, "Ramp down", Menu::NullItem,  miPeakTime,     miEditProfile, Menu::NullItem, editNumericalValue);
-MenuItem(miLoadProfile,  "Load Profile",  miSaveProfile,  miEditProfile, miExit, Menu::NullItem, saveLoadProfile);
+//MenuItem(miEditProfile, "Edit Profile", miLoadProfile, miCycleStart,   miExit, miRampUpRate, menuDummy);
+//  MenuItem(miRampUpRate, "Ramp up  ",   miSoakTemp,      Menu::NullItem, miEditProfile, Menu::NullItem, editNumericalValue);
+//  MenuItem(miSoakTemp,   "Soak temp", miSoakTime,      miRampUpRate,   miEditProfile, Menu::NullItem, editNumericalValue);
+//  MenuItem(miSoakTime,   "Soak time", miPeakTemp,      miSoakTemp,     miEditProfile, Menu::NullItem, editNumericalValue);
+//  MenuItem(miPeakTemp,   "Peak temp", miPeakTime,      miSoakTime,     miEditProfile, Menu::NullItem, editNumericalValue);
+//  MenuItem(miPeakTime,   "Peak time", miRampDnRate,    miPeakTemp,     miEditProfile, Menu::NullItem, editNumericalValue);
+//  MenuItem(miRampDnRate, "Ramp down", Menu::NullItem,  miPeakTime,     miEditProfile, Menu::NullItem, editNumericalValue);
+MenuItem(miLoadProfile,  "Load Profile",  miSaveProfile,  miCycleStart, miExit, Menu::NullItem, saveLoadProfile);
 MenuItem(miSaveProfile,  "Save Profile",  miPidSettings,  miLoadProfile, miExit, Menu::NullItem, saveLoadProfile);
 MenuItem(miPidSettings,  "PID Settings",  miFactoryReset, miSaveProfile, miExit, miPidSettingP,  menuDummy);
   MenuItem(miPidSettingP,  "Heater Kp",  miPidSettingI, Menu::NullItem, miPidSettings, Menu::NullItem, editNumericalValue);
@@ -659,13 +631,15 @@ uint8_t index = 0;              // the index of the current reading
 //
 void setupRelayPins(void) {
   DDRD  |= (1 << PIN_HEATER); // output
-  PORTD |= (1 << PIN_HEATER); // off ACTIVE LOW
+//  PORTD &= ~(1 << PIN_HEATER); // off ACTIVE HIGH
+  PORTD |=  (1 << PIN_HEATER); // off ACTIVE LOW
 }
 
 void killRelayPins(void) {
   Timer1.stop();
   FlexiTimer2::stop();
-  PORTD |= (1 << PIN_HEATER);  // off ACTIVE LOW
+//  PORTD &= ~(1 << PIN_HEATER);  // off ACTIVE HIGH
+  PORTD |=  (1 << PIN_HEATER); // off ACTIVE LOW
 }
 
 // ----------------------------------------------------------------------------
@@ -702,11 +676,14 @@ void zeroCrossingIsr(void) {
   if (heaterChannel.target > 0) {
     if ((zeroCrossTicks - heaterChannel.startW) <= heaterChannel.target) {
       PORTD &= ~(1 << heaterChannel.pin); // less than target, turn on
+//      PORTD |= (1 << heaterChannel.pin); // less than target, turn on
     } else {
       PORTD |= (1 << heaterChannel.pin);  // greater than target, turn off
+//      PORTD &= ~(1 << heaterChannel.pin);  // greater than target, turn off
     }
   } else {
     PORTD |= (1 << heaterChannel.pin);    // ZERO so turn off
+//    PORTD &= ~(1 << heaterChannel.pin);    // ZERO so turn off
   }
 }
 
@@ -806,7 +783,7 @@ uint16_t xOffset; // used for wraparound on x axis
 // ----------------------------------------------------------------------------
 
 void updateProcessDisplay() {
-  const uint8_t h =  86;
+  const uint8_t h =  66;
   const uint8_t w = 160;
   const uint8_t yOffset =  30; // space not available for graph  
 
@@ -825,12 +802,12 @@ void updateProcessDisplay() {
     tft.setCursor(2, y);
 #ifndef PIDTUNE
     tft.print("Profile ");
-    tft.print(profiles[activeProfileId].Name);
+    tft.print(activeProfile.Name);
 #else
     tft.print("Tuning ");
 #endif
 
-    tmp = h / ((uint16_t)profiles[activeProfileId].Phases[Phase3].ExitTemperatureC * 1.10) * 100.0;
+    tmp = h / ((uint16_t)activeProfile.Phases[Phase3].ExitTemperatureC * 1.20) * 100.0;
     pxPerC = (uint16_t)tmp;
     
     tmp = 60 * 6;
@@ -838,7 +815,7 @@ void updateProcessDisplay() {
     pxPerS = (uint16_t)tmp;
 
     // 50°C grid
-    int16_t t = (uint16_t)(profiles[activeProfileId].Phases[Phase3].ExitTemperatureC * 1.10);
+    int16_t t = (uint16_t)activeProfile.Phases[Phase3].ExitTemperatureC * 1.20;
     for (uint16_t tg = 0; tg < t; tg += 50) {
       uint16_t l = h - (tg * pxPerC / 100) + yOffset;
       tft.drawFastHLine(0, l, 160, tft.Color565(0xe0, 0xe0, 0xe0));
@@ -873,6 +850,8 @@ void updateProcessDisplay() {
   displayThermocoupleData(&A);
   tft.setTextSize(1);
 
+  Serial.print(elapsed); Serial.print(", "); Serial.print(Setpoint); Serial.print(", "); Serial.println(A.temperature);
+
 #ifndef PIDTUNE
   // current state
   y -= 2;
@@ -886,7 +865,7 @@ void updateProcessDisplay() {
     case Phase4:
     case Phase5:
     case CoolDown:
-      tft.print(profiles[activeProfileId].Phases[currentState].Name);
+      tft.print(activeProfile.Phases[currentState].Name);
       break;
       
     #define casePrintState(state) case state: tft.print(#state); break;
@@ -1021,6 +1000,8 @@ void setup() {
   Engine.navigate(&miCycleStart);
   currentState = Settings;
   menuUpdateRequest = true;
+
+  Serial.print("ReflowProfile size = ");Serial.println(sizeof(ReflowProfile));
 }
 
 // ----------------------------------------------------------------------------
@@ -1038,11 +1019,17 @@ void setup() {
 uint32_t lastRampTicks;
 uint32_t debugCounter = 0;
 
-void updateRampSetpoint(double rate, bool rising) {
+void updateRampSetpoint(double rate, bool rising, int limitC) {
   if (zeroCrossTicks > lastRampTicks) {
     Setpoint += (rate / ticksPerSec * (zeroCrossTicks - lastRampTicks)) * (rising ? 1 : -1);
     lastRampTicks = zeroCrossTicks;
   }
+  if (rising) {
+    Setpoint = (Setpoint > limitC) ? limitC : Setpoint;
+  } else {
+    Setpoint = (Setpoint < limitC) ? limitC : Setpoint;
+  }
+
   if ((debugCounter % 10) == 0) {
     Serial.print("update ramp: ");
     Serial.println(Setpoint);
@@ -1162,14 +1149,13 @@ void loop(void)
 
   if (zeroCrossTicks - lastUpdate >= CYCLE_PERIOD) {
     uint32_t deltaT = zeroCrossTicks - lastUpdate;
-    lastUpdate = zeroCrossTicks;
+    lastUpdate      = zeroCrossTicks;
 
     // ------------------------------------------------------------------------
     // Temperature
     // ------------------------------------------------------------------------
     
     readThermocouple(&A); // should be sufficient to read it every 250ms or 500ms
-//    A.temperature = encAbsolute; // debug mode, use encoder
   
     if (A.stat > 0) {
       thermocoupleErrorCount++;
@@ -1216,7 +1202,8 @@ void loop(void)
     // display update
     if (zeroCrossTicks - lastDisplayUpdate > DISPLAY_PERIOD) {
       lastDisplayUpdate = zeroCrossTicks;
-      if (currentState < None) {
+      if ((currentState < None) or
+          (currentState == Tune)){
         updateProcessDisplay();
       }
     }
@@ -1226,36 +1213,33 @@ void loop(void)
   // --------------------------------------------------------------------------
 
     switch (currentState) {
-#ifndef PIDTUNE
 
       // ----------------------------------------------------------------------
 
+#ifndef PIDTUNE
       case Phase1:
-          Output = 80; // Percent
-
       case Phase2: //Soak
       case Phase3: //Rampup
       case Phase4: //Peak
       case Phase5: //Rampdown
-      case CoolDown:
 
         if (stateChanged) {
-
           Serial.print("New state ");
           Serial.println(currentState);
           
           lastRampTicks = zeroCrossTicks;
           stateChanged = false;
           heaterChannel.startW = zeroCrossTicks;
-          Setpoint = profiles[activeProfileId].Phases[currentState].StartTemperatureC;
+          Setpoint = activeProfile.Phases[currentState].StartTemperatureC;
 
           PID.SetMode(AUTOMATIC);
           PID.SetControllerDirection(DIRECT);
           PID.SetTunings(heaterPID.Kp, heaterPID.Ki, heaterPID.Kd);
         }
 
-        updateRampSetpoint(profiles[activeProfileId].Phases[currentState].Rate,
-                           profiles[activeProfileId].Phases[currentState].Rising);
+        updateRampSetpoint(activeProfile.Phases[currentState].Rate,
+                           activeProfile.Phases[currentState].Rising,
+                           activeProfile.Phases[currentState].ExitTemperatureC);
 
         // --------------------------------------------------------------------
         // check if Phase end temperature reached
@@ -1263,21 +1247,27 @@ void loop(void)
         // --------------------------------------------------------------------
 
         nextState = currentState;
-        if (Setpoint >= profiles[activeProfileId].Phases[currentState].ExitTemperatureC) {
-          nextState = profiles[activeProfileId].Phases[currentState].NextState;
-          Serial.println("End state (temp reached) ");
-        }
-
-        if ((zeroCrossTicks - stateChangedTicks) >= (uint32_t)profiles[activeProfileId].Phases[currentState].ExitDurationS * ticksPerSec) {
-          nextState = profiles[activeProfileId].Phases[currentState].NextState;
+        if ((zeroCrossTicks - stateChangedTicks) >= activeProfile.Phases[currentState].ExitDurationS * ticksPerSec) {
+          nextState = activeProfile.Phases[currentState].NextState;
           Serial.println("End state (time reached) ");
         }
 
         currentState = nextState;
         break;
-
 #endif
 
+      case CoolDown:
+        if (stateChanged) {
+          stateChanged = false;
+          Setpoint = idleTemp;
+        }
+
+        if (Input < (idleTemp + 5)) {
+          currentState = Complete;
+          PID.SetMode(MANUAL);
+          Output = 0;
+        }
+      
 #ifdef PIDTUNE
       case Tune:
         {
@@ -1287,7 +1277,7 @@ void loop(void)
           if (val != 0) {
             currentState = CoolDown;
           }
-
+          
           if (currentState != Tune) { // we're done, set the tuning parameters
             heaterPID.Kp = PIDTune.GetKp();
             heaterPID.Ki = PIDTune.GetKi();
@@ -1297,10 +1287,17 @@ void loop(void)
 
             tft.setCursor(40, 40);
             tft.print("Kp: "); tft.print((uint32_t)(heaterPID.Kp * 100));
+            Serial.println();
+            Serial.print("Kp: "); Serial.print((uint32_t)(heaterPID.Kp * 100));
+            Serial.println();
             tft.setCursor(40, 52);
             tft.print("Ki: "); tft.print((uint32_t)(heaterPID.Ki * 100));
+            Serial.print("Ki: "); Serial.print((uint32_t)(heaterPID.Ki * 100));
+            Serial.println();
             tft.setCursor(40, 64);
             tft.print("Kd: "); tft.print((uint32_t)(heaterPID.Kd * 100));
+            Serial.print("Kd: "); Serial.print((uint32_t)(heaterPID.Kd * 100));
+            Serial.println();
           }
         }
         break;
@@ -1324,8 +1321,8 @@ void loop(void)
 // ----------------------------------------------------------------------------
 
 void memoryFeedbackScreen(uint8_t profileId, bool loading) {
-  tft.fillScreen(ST7735_GREEN);
-  tft.setTextColor(ST7735_BLACK);
+  tft.fillScreen(ST7735_YELLOW);
+  tft.setTextColor(ST7735_RED);
   tft.setCursor(10, 50);
   tft.print(loading ? "Loading" : "Saving");
   tft.print(" profile ");
@@ -1376,16 +1373,15 @@ void loadProfile(unsigned int targetProfile) {
 
 bool saveParameters(uint8_t profile) {
 #ifndef PIDTUNE
-  uint16_t offset = profile * sizeof(Profile_t);
+  uint16_t offset = profile * sizeof(ReflowProfile);
 
 #ifdef WITH_CHECKSUM
-  activeProfile.checksum = crc8((uint8_t *)&activeProfile, sizeof(Profile_t) - sizeof(uint8_t));
+   activeProfile.checksum = crc8((uint8_t *)&activeProfile, sizeof(ReflowProfile) - sizeof(uint8_t));
 #endif
 
   do {
   } while (!(eeprom_is_ready()));
-  
-  eeprom_write_block(&activeProfile, (void *)offset, sizeof(Profile_t));
+  eeprom_write_block(&activeProfile, (void *)offset, sizeof(ReflowProfile));
 #endif
   
   return true;
@@ -1394,15 +1390,14 @@ bool saveParameters(uint8_t profile) {
 // ----------------------------------------------------------------------------
 
 bool loadParameters(uint8_t profile) {
-  uint16_t offset = profile * sizeof(Profile_t);
+  uint16_t offset = profile * sizeof(ReflowProfile);
 
   do {
   } while (!(eeprom_is_ready()));
-  
-  eeprom_read_block(&activeProfile, (void *)offset, sizeof(Profile_t));
+  eeprom_read_block(&activeProfile, (void *)offset, sizeof(ReflowProfile));
 
 #ifdef WITH_CHECKSUM
-  return activeProfile.checksum == crc8((uint8_t *)&activeProfile, sizeof(Profile_t) - sizeof(uint8_t));
+  return activeProfile.checksum == crc8((uint8_t *)&activeProfile, sizeof(ReflowProfile) - sizeof(uint8_t));
 #else
   return true;  
 #endif
@@ -1433,9 +1428,9 @@ bool loadPID() {
 bool firstRun() { 
 #ifndef PIDTUNE
   // if all bytes of a profile in the middle of the eeprom space are 255, we assume it's a first run
-  unsigned int offset = 15 * sizeof(Profile_t);
+  unsigned int offset = 4 * sizeof(ReflowProfile);
 
-  for (uint16_t i = offset; i < offset + sizeof(Profile_t); i++) {
+  for (uint16_t i = offset; i < offset + sizeof(ReflowProfile); i++) {
     if (EEPROM.read(i) != 255) {
       return false;
     }
@@ -1447,12 +1442,7 @@ bool firstRun() {
 // ----------------------------------------------------------------------------
 
 void makeDefaultProfile() {
-  activeProfile.soakTemp     = 150;
-  activeProfile.soakDuration =  80;
-  activeProfile.peakTemp     = 220;
-  activeProfile.peakDuration =  40;
-  activeProfile.rampUpRate   =   0.80;
-  activeProfile.rampDownRate =   2.0;
+   activeProfile = defaultProfile;
 }
 
 // ----------------------------------------------------------------------------
@@ -1465,22 +1455,21 @@ void factoryReset() {
   tft.setTextColor(ST7735_WHITE);
   tft.setCursor(10, 50);
   tft.print("Resetting...");
-
+#endif
   // then save the same profile settings into all slots
   for (uint8_t i = 0; i < maxProfiles; i++) {
     saveParameters(i);
   }
 
-  heaterPID.Kp =  0.60; 
-  heaterPID.Ki =  0.01;
-  heaterPID.Kd = 19.70;
+  heaterPID.Kp =  4.25; 
+  heaterPID.Ki =  0.25;
+  heaterPID.Kd =  6.50;
   savePID();
 
   activeProfileId = 0;
   saveLastUsedProfile();
 
   delay(500);
-#endif
 }
 
 // ----------------------------------------------------------------------------
