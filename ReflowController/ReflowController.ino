@@ -114,7 +114,6 @@ State     nextState         = Idle;
 State     previousState     = Idle;
 bool      stateChanged      = false;
 uint32_t  stateChangedTicks = 0;
-
 int       activeProfileId   = 0;
 int       idleTemp          = 50; // temperature at which to leave the oven to safely cool naturally
 
@@ -172,7 +171,6 @@ MAX6675 sensor(THERMOCOUPLE1_CLK,
                THERMOCOUPLE1_CS,
                THERMOCOUPLE1_DO);
 
-
 // ----------------------------------------------------------------------------
 
 void readThermocouple(struct Thermocouple* input) {
@@ -201,9 +199,9 @@ void readThermocouple(struct Thermocouple* input) {
 // NB: Adafruit GFX ASCII-Table is bogous: https://github.com/adafruit/Adafruit-GFX-Library/issues/22
 //
 
-Adafruit_ST7735 tft = Adafruit_ST7735(LCD_CS, LCD_DC, LCD_RST);
-ClickEncoder    Encoder(ENCODER_A, ENCODER_B, ENCODER_SW, ENCODER_CLICKS);
-Menu::Engine    Engine;
+Adafruit_ST7735  tft = Adafruit_ST7735(LCD_CS, LCD_DC, LCD_RST);
+ClickEncoder     Encoder(ENCODER_A, ENCODER_B, ENCODER_SW, ENCODER_CLICKS);
+Menu::Engine     Engine;
 
 int16_t       encMovement;
 int16_t       encAbsolute;
@@ -212,10 +210,10 @@ const uint8_t menuItemsVisible      = 8;
 const uint8_t menuItemHeight        = 14;
 bool          menuUpdateRequest     = true;
 bool          initialProcessDisplay = false;
+int16_t       editPhase = 0;
 
 #define       PROMPT_Y 100
 #define       EXIT_Y   114
-
 
 // ----------------------------------------------------------------------------
 
@@ -240,12 +238,11 @@ void clearLastMenuItemRenderState() {
 
 // ----------------------------------------------------------------------------
 
-extern const Menu::Item_t miRampUpRate, 
-                          miRampDnRate, 
-                          miSoakTime, 
-                          miSoakTemp, 
-                          miPeakTime, 
-                          miPeakTemp,
+extern const Menu::Item_t miEditPhase,
+                          miStartTemp, 
+                          miEndTemp, 
+                          miRate, 
+                          miDuration, 
                           miLoadProfile, 
                           miSaveProfile,
                           miPidSettingP, 
@@ -286,7 +283,7 @@ unsigned int aTuneLookBack = 30;
 
 bool menuExit(const Menu::Action_t a) {
   clearLastMenuItemRenderState();
-
+  editPhase = 0;
   Engine.lastInvokedItem  = &Menu::NullItem;
   menuUpdateRequest       = false;
   return false;
@@ -308,15 +305,14 @@ void printDouble(double val, uint8_t precision = 1) {
 // ----------------------------------------------------------------------------
 
 void getItemValuePointer(const Menu::Item_t *mi, double **d, int16_t **i) {
-//  if (mi == &miRampUpRate)  *d = &activeProfile.rampUpRate;
-//  if (mi == &miRampDnRate)  *d = &activeProfile.rampDownRate;
-//  if (mi == &miSoakTime)    *i = &activeProfile.soakDuration;
-//  if (mi == &miSoakTemp)    *i = &activeProfile.soakTemp;
-//  if (mi == &miPeakTime)    *i = &activeProfile.peakDuration;
-//  if (mi == &miPeakTemp)    *i = &activeProfile.peakTemp;
-  if (mi == &miPidSettingP) *d = &heaterPID.Kp;
-  if (mi == &miPidSettingI) *d = &heaterPID.Ki;
-  if (mi == &miPidSettingD) *d = &heaterPID.Kd; 
+  if (mi == &miEditPhase)     *i = &editPhase;
+  if (mi == &miStartTemp)     *i = &activeProfile.Phases[editPhase].StartTemperatureC;
+  if (mi == &miEndTemp)       *i = &activeProfile.Phases[editPhase].ExitTemperatureC;
+  if (mi == &miRate)          *d = &activeProfile.Phases[editPhase].Rate;
+  if (mi == &miDuration)      *i = &activeProfile.Phases[editPhase].ExitDurationS;
+  if (mi == &miPidSettingP)   *d = &heaterPID.Kp;
+  if (mi == &miPidSettingI)   *d = &heaterPID.Ki;
+  if (mi == &miPidSettingD)   *d = &heaterPID.Kd; 
 }
 
 // ----------------------------------------------------------------------------
@@ -325,8 +321,8 @@ bool isPidSetting(const Menu::Item_t *mi) {
   return mi == &miPidSettingP || mi == &miPidSettingI || mi == &miPidSettingD;
 }
 
-bool isRampSetting(const Menu::Item_t *mi) {
-//  return mi == &miRampUpRate || mi == &miRampDnRate;
+bool isRate(const Menu::Item_t *mi) {
+  return mi == &miRate;
 }
 
 // ----------------------------------------------------------------------------
@@ -334,29 +330,20 @@ bool isRampSetting(const Menu::Item_t *mi) {
 bool getItemValueLabel(const Menu::Item_t *mi, char *label) {
   int16_t *iValue = NULL;
   double  *dValue = NULL;
-  char *p;
   
   getItemValuePointer(mi, &dValue, &iValue);
 
-  if (isRampSetting(mi) || isPidSetting(mi)) {
-    p = label;
-    ftoa(p, *dValue, (isPidSetting(mi)) ? 2 : 1); // need greater precision with pid values
-    p = label;
-    
-    if (isRampSetting(mi)) {
-      while(*p != '\0') p++;
-      *p++ = 0xf7; *p++ = 'C'; *p++ = '/'; *p++ = 's';
-      *p = '\0';
-    }
+  if (isPidSetting(mi)) {
+    ftoa(label, *dValue, 2); // need greater precision with pid values
+  } else if (mi == &miStartTemp || mi == &miEndTemp) {
+      itostr(label, *iValue, "\367C");
+  } else if (mi == &miDuration) {
+      itostr(label, *iValue, "s");
+  } else if (mi == &miRate) {
+      ftoa(label, *dValue, 1);
+  } else if (mi == &miEditPhase) {
+      itostr(label, *iValue, "");
   }
- // else {
- //   if (mi == &miPeakTemp || mi == &miSoakTemp) {
- //     itostr(label, *iValue, "\367C");
- //   }
- //   if (mi == &miPeakTime || mi == &miSoakTime) {
- //     itostr(label, *iValue, "s");
- //   }
- // }
 
   return dValue || iValue;
 }
@@ -394,9 +381,9 @@ bool editNumericalValue(const Menu::Action_t action) {
     double  *dValue = NULL;
     getItemValuePointer(Engine.currentItem, &dValue, &iValue);
 
-    if (isRampSetting(Engine.currentItem) || isPidSetting(Engine.currentItem)) {
+    if (isPidSetting(Engine.currentItem)) {
       double tmp;
-      double factor = (isPidSetting(Engine.currentItem)) ? 100 : 10;
+      double factor = 100;
       
       if (initial) {
         tmp = *dValue;
@@ -409,9 +396,29 @@ bool editNumericalValue(const Menu::Action_t action) {
         *dValue = tmp;
       }      
     }
-    else {
-      if (initial) encAbsolute = *iValue;
-      else *iValue = encAbsolute;
+    else if (isRate(Engine.currentItem)) {
+      double tmp;
+      double factor = 10;
+      
+      if (initial) {
+        tmp = *dValue;
+        tmp *= factor;
+        encAbsolute = (int16_t)tmp;
+      }
+      else {
+        tmp = encAbsolute;
+        tmp /= factor;
+        *dValue = tmp;
+      }      
+    } else if (Engine.currentItem == &miEditPhase) {
+      if (initial) encAbsolute = *iValue; else *iValue = encAbsolute;
+      if (*iValue < 0) *iValue = 0;
+      if (*iValue >= NUM_PHASES) *iValue = NUM_PHASES -1;
+    } else {      
+      if (initial) 
+        encAbsolute = *iValue;
+      else 
+        *iValue = encAbsolute;
     }
 
     getItemValueLabel(Engine.currentItem, buf);
@@ -423,7 +430,6 @@ bool editNumericalValue(const Menu::Action_t action) {
     clearLastMenuItemRenderState();
     menuUpdateRequest = true;
     Engine.lastInvokedItem = &Menu::NullItem;
-
 
     if (currentState == Edit) { // leave edit mode, return to menu (
       if (isPidSetting(Engine.currentItem)) {
@@ -484,7 +490,6 @@ void saveProfile(unsigned int targetProfile, bool quiet = false);
 bool saveLoadProfile(const Menu::Action_t action) {
 #ifndef PIDTUNE
   bool isLoad = Engine.currentItem == &miLoadProfile;
-
   if (action == Menu::actionDisplay) {
     bool initial = currentState != Edit;
     currentState = Edit;
@@ -585,29 +590,30 @@ void renderMenuItem(const Menu::Item_t *mi, uint8_t pos) {
 }
 
 // ----------------------------------------------------------------------------
-// Name, Label, Next, Previous, Parent, Child, Callback
+// Name,                    Label,          Next,         Previous,        Parent,        Child,           Callback
 
-MenuItem(miExit, "", Menu::NullItem, Menu::NullItem, Menu::NullItem, miCycleStart, menuExit);
+MenuItem(miExit,         "",              Menu::NullItem,   Menu::NullItem, Menu::NullItem, miCycleStart,   menuExit);
 
 #ifndef PIDTUNE
-MenuItem(miCycleStart,  "Start Cycle",  miLoadProfile, Menu::NullItem, miExit, Menu::NullItem, cycleStart);
+MenuItem(miCycleStart,   "Start Cycle",   miEditProfile,    Menu::NullItem, miExit,         Menu::NullItem, cycleStart);
 #else
-MenuItem(miCycleStart,  "Start Autotune",  miPidSettings, Menu::NullItem, miExit, Menu::NullItem, cycleStart);
+MenuItem(miCycleStart,   "Start Autotune",miPidSettings,    Menu::NullItem, miExit,         Menu::NullItem, cycleStart);
 #endif
-//MenuItem(miEditProfile, "Edit Profile", miLoadProfile, miCycleStart,   miExit, miRampUpRate, menuDummy);
-//  MenuItem(miRampUpRate, "Ramp up  ",   miSoakTemp,      Menu::NullItem, miEditProfile, Menu::NullItem, editNumericalValue);
-//  MenuItem(miSoakTemp,   "Soak temp", miSoakTime,      miRampUpRate,   miEditProfile, Menu::NullItem, editNumericalValue);
-//  MenuItem(miSoakTime,   "Soak time", miPeakTemp,      miSoakTemp,     miEditProfile, Menu::NullItem, editNumericalValue);
-//  MenuItem(miPeakTemp,   "Peak temp", miPeakTime,      miSoakTime,     miEditProfile, Menu::NullItem, editNumericalValue);
-//  MenuItem(miPeakTime,   "Peak time", miRampDnRate,    miPeakTemp,     miEditProfile, Menu::NullItem, editNumericalValue);
-//  MenuItem(miRampDnRate, "Ramp down", Menu::NullItem,  miPeakTime,     miEditProfile, Menu::NullItem, editNumericalValue);
-MenuItem(miLoadProfile,  "Load Profile",  miSaveProfile,  miCycleStart, miExit, Menu::NullItem, saveLoadProfile);
-MenuItem(miSaveProfile,  "Save Profile",  miPidSettings,  miLoadProfile, miExit, Menu::NullItem, saveLoadProfile);
-MenuItem(miPidSettings,  "PID Settings",  miFactoryReset, miSaveProfile, miExit, miPidSettingP,  menuDummy);
-  MenuItem(miPidSettingP,  "Heater Kp",  miPidSettingI, Menu::NullItem, miPidSettings, Menu::NullItem, editNumericalValue);
-  MenuItem(miPidSettingI,  "Heater Ki",  miPidSettingD, miPidSettingP,  miPidSettings, Menu::NullItem, editNumericalValue);
-  MenuItem(miPidSettingD,  "Heater Kd",  Menu::NullItem, miPidSettingI, miPidSettings, Menu::NullItem, editNumericalValue);
-MenuItem(miFactoryReset, "Factory Reset", Menu::NullItem, miPidSettings, miExit, Menu::NullItem, factoryReset);
+
+MenuItem(miEditProfile,  "Edit Profile",  miLoadProfile,    miCycleStart,   miExit,         miEditPhase,    menuDummy);
+  MenuItem(miEditPhase,    "Phase    ",     miStartTemp,      Menu::NullItem, miEditProfile,  Menu::NullItem, editNumericalValue);
+  MenuItem(miStartTemp,    "StartTemp",     miEndTemp,        miEditPhase,    miEditProfile,  Menu::NullItem, editNumericalValue);
+  MenuItem(miEndTemp,      "End Temp ",     miDuration,       miStartTemp,    miEditProfile,  Menu::NullItem, editNumericalValue);
+  MenuItem(miDuration,     "Duration ",     miRate,           miEndTemp,      miEditProfile,  Menu::NullItem, editNumericalValue);
+  MenuItem(miRate,         "Rate     ",     Menu::NullItem,   miDuration,     miEditProfile,  Menu::NullItem, editNumericalValue);
+
+MenuItem(miLoadProfile,  "Load Profile",  miSaveProfile,    miEditProfile,  miExit,         Menu::NullItem, saveLoadProfile);
+MenuItem(miSaveProfile,  "Save Profile",  miPidSettings,    miLoadProfile,  miExit,         Menu::NullItem, saveLoadProfile);
+MenuItem(miPidSettings,  "PID Settings",  miFactoryReset,   miSaveProfile,  miExit,         miPidSettingP,  menuDummy);
+  MenuItem(miPidSettingP,  "Heater Kp",     miPidSettingI,    Menu::NullItem, miPidSettings,  Menu::NullItem, editNumericalValue);
+  MenuItem(miPidSettingI,  "Heater Ki",     miPidSettingD,    miPidSettingP,  miPidSettings,  Menu::NullItem, editNumericalValue);
+  MenuItem(miPidSettingD,  "Heater Kd",     Menu::NullItem,   miPidSettingI,  miPidSettings,  Menu::NullItem, editNumericalValue);
+MenuItem(miFactoryReset, "Factory Reset", Menu::NullItem,   miPidSettings,  miExit,         Menu::NullItem, factoryReset);
 
 // ----------------------------------------------------------------------------
 
@@ -691,8 +697,6 @@ void zeroCrossingIsr(void) {
 // timer interrupt handling
 
 void timerIsr(void) { // ticks with 100µS
-
-  static uint32_t lastTicks = 0;
 
   // handle encoder + button
   if (!(timerTicks % 10)) {
@@ -1000,8 +1004,6 @@ void setup() {
   Engine.navigate(&miCycleStart);
   currentState = Settings;
   menuUpdateRequest = true;
-
-  Serial.print("ReflowProfile size = ");Serial.println(sizeof(ReflowProfile));
 }
 
 // ----------------------------------------------------------------------------
@@ -1017,7 +1019,6 @@ void setup() {
 // ----------------------------------------------------------------------------
 
 uint32_t lastRampTicks;
-uint32_t debugCounter = 0;
 
 void updateRampSetpoint(double rate, bool rising, int limitC) {
   if (zeroCrossTicks > lastRampTicks) {
@@ -1029,12 +1030,6 @@ void updateRampSetpoint(double rate, bool rising, int limitC) {
   } else {
     Setpoint = (Setpoint < limitC) ? limitC : Setpoint;
   }
-
-  if ((debugCounter % 10) == 0) {
-    Serial.print("update ramp: ");
-    Serial.println(Setpoint);
-  }
-  debugCounter++;
 }
 
 // ----------------------------------------------------------------------------
@@ -1097,7 +1092,9 @@ void loop(void)
         Engine.invoke();
       }
       else if (currentState < Complete) {
-        currentState = Phase5;
+        currentState = CoolDown;
+        PID.SetMode(MANUAL);
+        Output = 0;
       }
       break;
 
@@ -1350,21 +1347,19 @@ void loadProfile(unsigned int targetProfile) {
   memoryFeedbackScreen(activeProfileId, true);
   bool ok = loadParameters(targetProfile);
 
-#if 0
   if (!ok) {
-    lcd.setCursor(0, 2);
-    lcd.print("Checksum error!");
-    lcd.setCursor(0, 3);
-    lcd.print("Review profile.");
-    delay(2500);
+    tft.fillScreen(ST7735_RED);
+    tft.setTextColor(ST7735_WHITE);
+    tft.setCursor(10, 40);
+    tft.print("Checksum error!");
+    tft.setCursor(10, 60);
+    tft.print("Review profile.");
+    delay(10000);
   }
-#endif
 
   // save in any way, as we have no undo
   activeProfileId = targetProfile;
   saveLastUsedProfile();
-
-  delay(500);
 }
 
 // ----------------------------------------------------------------------------
@@ -1396,11 +1391,20 @@ bool loadParameters(uint8_t profile) {
   } while (!(eeprom_is_ready()));
   eeprom_read_block(&activeProfile, (void *)offset, sizeof(ReflowProfile));
 
+  for (uint8_t i=0; i<NUM_PHASES; i++) {
+    activeProfile.Phases[i].Rising = false;
+    if (activeProfile.Phases[i].ExitTemperatureC >= activeProfile.Phases[i].StartTemperatureC) {
+      activeProfile.Phases[i].Rising = true;
+    }
+  }
+  
 #ifdef WITH_CHECKSUM
   return activeProfile.checksum == crc8((uint8_t *)&activeProfile, sizeof(ReflowProfile) - sizeof(uint8_t));
 #else
   return true;  
 #endif
+
+
 }
 
 // ----------------------------------------------------------------------------
@@ -1442,7 +1446,7 @@ bool firstRun() {
 // ----------------------------------------------------------------------------
 
 void makeDefaultProfile() {
-   activeProfile = defaultProfile;
+   memcpy(&activeProfile, &defaultProfile,sizeof(defaultProfile));
 }
 
 // ----------------------------------------------------------------------------
