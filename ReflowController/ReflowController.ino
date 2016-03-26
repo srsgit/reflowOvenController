@@ -14,7 +14,7 @@
 // Arduino 328P UNO or Duemilanove
 // ----------------------------------------------------------------------------
 
-const char *ver = "SRS 0.9f";
+const char *ver = "SRS 0.9g";
 
 // ----------------------------------------------------------------------------
 
@@ -77,6 +77,8 @@ static int ticksPerSec = 1000 / TICK_PERIOD;
 
 #define ENCODER_CLICKS     4  // 
 
+#define SOUNDER            A5 // alert to open oven door for rapid temp drop
+
 // ----------------------------------------------------------------------------
 #define WITH_SPLASH 1
 // ----------------------------------------------------------------------------
@@ -84,7 +86,7 @@ static int ticksPerSec = 1000 / TICK_PERIOD;
 volatile uint32_t timerTicks     = 0;
 volatile uint32_t zeroCrossTicks = 0;
 
-const uint8_t     maxProfiles = 8;
+const uint8_t     maxProfiles = 4;
 
 char buf[20]; // generic char buffer
 
@@ -100,8 +102,7 @@ typedef enum {
   CoolDown,
   Complete = 20,
 
-  None,     
-  Idle,
+  Idle,     
   Settings,
   Edit,
 
@@ -118,7 +119,7 @@ int       activeProfileId   = 0;
 int       idleTemp          = 50; // temperature at which to leave the oven to safely cool naturally
 
 struct ReflowPhase {
-  char    Name[15];
+  char    Name[12];
   int     StartTemperatureC;
   int     ExitTemperatureC;
   double  Rate;
@@ -128,22 +129,21 @@ struct ReflowPhase {
 };
 
 struct ReflowProfile {
-  char        Name[15];
   ReflowPhase Phases[NUM_PHASES];
   uint8_t     checksum;
 };
 
 ReflowProfile activeProfile;
 
-ReflowProfile defaultProfile = 
-{"Leaded",
-  {// Zone         Start(C)   Exit(C)   Rate    Duration,   Rising Next
+ReflowProfile defaultProfile = {
+  { // Zone         Start(C)   Exit(C)   Rate    Duration,   Rising Next
     { "Pre-heat",    60,      150,      1.5,    120,        true,  Phase2},
     { "Soak",       150,      180,      0.8,     45,        true,  Phase3},
-    { "ReflowPeak", 225,      250,      0.0,     40,        true,  Phase4},
-    { "ReflowCool", 180,      150,      1.5,     30,        false, Phase5},
-    { "Cool",       150,       40,      2.0,    180,        false, CoolDown},
-  }
+    { "ReflowPeak", 225,      225,      0.0,     40,        true,  Phase4},
+    { "ReflowCool", 180,      150,      2.0,     30,        false, Phase5},
+    { "Cool",       150,       40,      1.5,    180,        false, CoolDown},
+  },
+  0
 };
 
 // EEPROM offsets
@@ -185,13 +185,6 @@ void readThermocouple(struct Thermocouple* input) {
     input->temperature = lastTemp;
   }
   lastTemp = input->temperature;
-
-#ifdef DEBUG
-  Serial.print("Temp=");
-  Serial.print(t);
-  Serial.print("   Stat=");
-  Serial.println(input->stat);
-#endif
 }
 
 // ----------------------------------------------------------------------------
@@ -806,7 +799,7 @@ void updateProcessDisplay() {
     tft.setCursor(2, y);
 #ifndef PIDTUNE
     tft.print("Profile ");
-    tft.print(activeProfile.Name);
+    tft.print(activeProfileId);
 #else
     tft.print("Tuning ");
 #endif
@@ -938,6 +931,9 @@ void setup() {
   // setup /CS line for display
   pinMode(LCD_CS, OUTPUT);
   digitalWrite(LCD_CS, HIGH);
+
+  pinMode(SOUNDER, OUTPUT);
+  digitalWrite(SOUNDER, LOW);
   
   Serial.begin(57600);
 
@@ -1124,7 +1120,11 @@ void loop(void)
 
   if (menuUpdateRequest) {
     menuUpdateRequest = false;
-    if (currentState < UIMenuEnd && !encMovement && currentState != Edit && previousState != Edit) { // clear menu on child/parent navigation
+    if (currentState < UIMenuEnd && 
+        !encMovement && 
+        currentState != Edit && 
+        previousState != Edit) 
+    { // clear menu on child/parent navigation
       tft.fillScreen(ST7735_WHITE);
     }  
     Engine.render(renderMenuItem, menuItemsVisible);
@@ -1199,7 +1199,7 @@ void loop(void)
     // display update
     if (zeroCrossTicks - lastDisplayUpdate > DISPLAY_PERIOD) {
       lastDisplayUpdate = zeroCrossTicks;
-      if ((currentState < None) or
+      if ((currentState < Idle) or  // Active or Tuning
           (currentState == Tune)){
         updateProcessDisplay();
       }
@@ -1224,14 +1224,19 @@ void loop(void)
           Serial.print("New state ");
           Serial.println(currentState);
           
-          lastRampTicks = zeroCrossTicks;
-          stateChanged = false;
+          lastRampTicks        = zeroCrossTicks;
+          stateChanged         = false;
           heaterChannel.startW = zeroCrossTicks;
-          Setpoint = activeProfile.Phases[currentState].StartTemperatureC;
+          Setpoint             = activeProfile.Phases[currentState].StartTemperatureC;
 
-          PID.SetMode(AUTOMATIC);
-          PID.SetControllerDirection(DIRECT);
-          PID.SetTunings(heaterPID.Kp, heaterPID.Ki, heaterPID.Kd);
+          // Indicate sounder if need a rapid fall by opening the oven door
+          
+          if (not activeProfile.Phases[currentState].Rising &&
+              activeProfile.Phases[currentState].Rate >= 2.0) {
+            digitalWrite(SOUNDER, HIGH); 
+          } else {
+            digitalWrite(SOUNDER, LOW); 
+          }
         }
 
         updateRampSetpoint(activeProfile.Phases[currentState].Rate,
@@ -1344,6 +1349,7 @@ void saveProfile(unsigned int targetProfile, bool quiet) {
 // ----------------------------------------------------------------------------
 
 void loadProfile(unsigned int targetProfile) {
+
   memoryFeedbackScreen(activeProfileId, true);
   bool ok = loadParameters(targetProfile);
 
@@ -1392,14 +1398,14 @@ bool loadParameters(uint8_t profile) {
   eeprom_read_block(&activeProfile, (void *)offset, sizeof(ReflowProfile));
 
   for (uint8_t i=0; i<NUM_PHASES; i++) {
-    activeProfile.Phases[i].Rising = false;
-    if (activeProfile.Phases[i].ExitTemperatureC >= activeProfile.Phases[i].StartTemperatureC) {
-      activeProfile.Phases[i].Rising = true;
+    activeProfile.Phases[i].Rising = true;
+    if (activeProfile.Phases[i].ExitTemperatureC < activeProfile.Phases[i].StartTemperatureC) {
+      activeProfile.Phases[i].Rising = false;
     }
   }
   
 #ifdef WITH_CHECKSUM
-  return activeProfile.checksum == crc8((uint8_t *)&activeProfile, sizeof(ReflowProfile) - sizeof(uint8_t));
+  return (activeProfile.checksum == crc8((uint8_t *)&activeProfile, sizeof(ReflowProfile) - sizeof(uint8_t)));
 #else
   return true;  
 #endif
