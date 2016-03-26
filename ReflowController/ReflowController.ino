@@ -137,8 +137,8 @@ ReflowProfile activeProfile;
 
 ReflowProfile defaultProfile = {
   { // Zone         Start(C)   Exit(C)   Rate    Duration,   Rising Next
-    { "Pre-heat",    60,      150,      1.5,    120,        true,  Phase2},
-    { "Soak",       150,      180,      0.8,     45,        true,  Phase3},
+    { "Pre-heat",    50,      150,      1.0,    180,        true,  Phase2},
+    { "Soak",       150,      180,      0.6,     60,        true,  Phase3},
     { "ReflowPeak", 225,      225,      0.0,     40,        true,  Phase4},
     { "ReflowCool", 180,      150,      2.0,     30,        false, Phase5},
     { "Cool",       150,       40,      1.5,    180,        false, CoolDown},
@@ -773,6 +773,8 @@ uint16_t pxPerS;
 uint16_t pxPerC;
 uint16_t xOffset; // used for wraparound on x axis
 
+#define FULL_X  7 * 60 // 6 minutes
+
 // ----------------------------------------------------------------------------
 // 
 // Refresh screen
@@ -807,24 +809,17 @@ void updateProcessDisplay() {
     tmp = h / ((uint16_t)activeProfile.Phases[Phase3].ExitTemperatureC * 1.20) * 100.0;
     pxPerC = (uint16_t)tmp;
     
-    tmp = 60 * 6;
+    tmp = FULL_X;
     tmp = w / tmp * 10.0; 
     pxPerS = (uint16_t)tmp;
 
     // 50°C grid
-    int16_t t = (uint16_t)activeProfile.Phases[Phase3].ExitTemperatureC * 1.20;
+    int16_t t = (uint16_t)activeProfile.Phases[Phase3].ExitTemperatureC * 1.20; //assume Phase 3 is peak
     for (uint16_t tg = 0; tg < t; tg += 50) {
       uint16_t l = h - (tg * pxPerC / 100) + yOffset;
       tft.drawFastHLine(0, l, 160, tft.Color565(0xe0, 0xe0, 0xe0));
     }
 #ifdef GRAPH_VERBOSE
-
-#ifdef DEBUG
-    Serial.print("Calc pxPerC/S: ");
-    Serial.print(pxPerC);
-    Serial.print("/");
-    Serial.println(pxPerS);
-#endif
 
 #endif
   }
@@ -847,7 +842,9 @@ void updateProcessDisplay() {
   displayThermocoupleData(&A);
   tft.setTextSize(1);
 
-  Serial.print(elapsed); Serial.print(", "); Serial.print(Setpoint); Serial.print(", "); Serial.println(A.temperature);
+  Serial.print(","); // One column over if treated as CSV
+  Serial.print(elapsed); Serial.print(", "); 
+  Serial.print(Setpoint); Serial.print(", "); Serial.println(A.temperature);
 
 #ifndef PIDTUNE
   // current state
@@ -965,14 +962,12 @@ void setup() {
   tft.setCursor(10, 30);
   tft.setTextSize(2);
   tft.print("Reflow");
-  tft.setCursor(24, 48);
+  tft.setCursor(10, 48);
   tft.print("Controller");
   tft.setTextSize(1);
   tft.setCursor(52, 67);
   tft.print("v"); tft.print(ver);
-  tft.setCursor(7, 119);
-  tft.print("(c)2014 karl@pitrich.com");
-  delay(1000);
+  delay(2000);
 #endif
 
   readThermocouple(&A);
@@ -1452,22 +1447,33 @@ bool firstRun() {
 // ----------------------------------------------------------------------------
 
 void makeDefaultProfile() {
-   memcpy(&activeProfile, &defaultProfile,sizeof(defaultProfile));
+   memcpy(&activeProfile, &defaultProfile, sizeof(defaultProfile));
 }
 
 // ----------------------------------------------------------------------------
 
 void factoryReset() {
 #ifndef PIDTUNE
+
+  tft.fillScreen(ST7735_RED);
+  tft.setTextColor(ST7735_WHITE);
+  tft.setCursor(10, 50);
+  tft.print("Clear EEPROM...");
+
+  for (int i = 0 ; i < EEPROM.length() ; i++) {
+    EEPROM.write(i, 0);
+  }
+  
   makeDefaultProfile();
 
   tft.fillScreen(ST7735_RED);
   tft.setTextColor(ST7735_WHITE);
   tft.setCursor(10, 50);
-  tft.print("Resetting...");
+  tft.print("Resetting profiles...");
 #endif
+
   // then save the same profile settings into all slots
-  for (uint8_t i = 0; i < maxProfiles; i++) {
+  for (uint8_t i = 0; i <= maxProfiles; i++) {
     saveParameters(i);
   }
 
@@ -1479,7 +1485,7 @@ void factoryReset() {
   activeProfileId = 0;
   saveLastUsedProfile();
 
-  delay(500);
+  delay(1000);
 }
 
 // ----------------------------------------------------------------------------
