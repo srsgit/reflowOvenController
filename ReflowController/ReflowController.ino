@@ -11,17 +11,16 @@
 // rotary encoder/push button
 // MAX6675 K type thermocouple
 // SSR drive active low
+// 5V buzzer
 // Arduino 328P UNO or Duemilanove
 // ----------------------------------------------------------------------------
 
-const char *ver = "SRS 0.9(i)";
+const char *ver = "SRS 0.9(k)";
 
 // ----------------------------------------------------------------------------
 
 // #define PIDTUNE 0 // 
 // #define DEBUG
-
-#define DEFAULT_LOOP_DELAY  70 // should be about 16% less for 60Hz mains
 
 #include <avr/eeprom.h>
 #include <EEPROM.h>
@@ -40,14 +39,14 @@ const char *ver = "SRS 0.9(i)";
 #include <PID_AutoTune_v0.h>
 #endif
 
-#define  TICK_PERIOD       10   // xx ms for zero crossing ISR
-#define  CYCLE_PERIOD      10   // TICK PERIODS
-#define  DISPLAY_PERIOD    25   // TICK PERIODS
+#define TICK_PERIOD       10   // xx ms for zero crossing ISR
+#define CYCLE_PERIOD      20   // TICK PERIODS
+#define DISPLAY_PERIOD    50   // TICK PERIODS
 
 static int ticksPerSec = 1000 / TICK_PERIOD;
 
-#define  MAX_START_TEMP    50  // maximum temperature where a new reflow session will be allowed to start
-#define  NUM_PHASES         5  // number of phases in a profile
+#define MAX_START_TEMP    50  // maximum temperature where a new reflow session will be allowed to start
+#define NUM_PHASES         6  // number of phases in a profile
 
 #define DEFAULT_HEATER_Kp 4.25
 #define DEFAULT_HEATER_Ki 0.25
@@ -87,10 +86,10 @@ static int ticksPerSec = 1000 / TICK_PERIOD;
 #define WITH_SPLASH 1
 // ----------------------------------------------------------------------------
 
-volatile uint32_t timerTicks     = 0;
-volatile uint32_t zeroCrossTicks = 0;
+volatile uint32_t timerTicks      = 0;
+volatile uint32_t zeroCrossTicks  = 0;
 
-const uint8_t     maxProfiles = 4;
+const uint8_t     maxProfiles     = 6;   
 uint16_t          profileDuration = 300;
 uint16_t          profilePeak     = 220;
 
@@ -103,12 +102,11 @@ typedef enum {
   Phase1 = 0, // RampToSoak
   Phase2,     // Soak
   Phase3,     // RampUp
-  Phase4,     // Peak
+  Phase4,     // PeakDn
   Phase5,     // Rampdown
-  CoolDown,
+  CoolDown,   
   Complete = 20,
 
-  Idle,     
   Settings,
   Edit,
 
@@ -116,9 +114,9 @@ typedef enum {
   Tune = 30
 } State;
 
-State     currentState      = Idle;
-State     nextState         = Idle;
-State     previousState     = Idle;
+State     currentState      = Settings;
+State     nextState         = Settings;
+State     previousState     = Settings;
 bool      stateChanged      = false;
 uint32_t  stateChangedTicks = 0;
 int       activeProfileId   = 0;
@@ -142,12 +140,12 @@ struct ReflowProfile {
 ReflowProfile activeProfile;
 
 ReflowProfile defaultProfile = {
-  { // Zone         Start(C)   Exit(C)   Rate    Duration,   Rising  Next
-    { "Pre-heat",    50,      150,      1.0,    160,        true,    Phase2},
-    { "Soak",       150,      180,      0.6,     60,        true,    Phase3},
-    { "ReflowPeak", 180,      220,     10.0,     40,        true,    Phase4},
-    { "ReflowCool", 220,      180,     10.0,      4,        false,   Phase5},
-    { "Cool",       180,       50,      1.5,    120,        false,   CoolDown},
+  { // Zone         Start(C)  Exit(C)   Rate    Duration,   Rising   Next
+    { "Preheat  ",     50,      150,      1.2,    120,        true,    Phase2},
+    { "Soak     ",    150,      180,      0.8,     60,        true,    Phase3},
+    { "Ramp Up  ",    180,      210,     10.0,     45,        true,    Phase4},
+    { "Alert    ",    210,      180,     10.0,      3,        false,   Phase5},
+    { "Cool     ",    180,       50,      1.9,    150,        false,   CoolDown},
   },
   0
 };
@@ -246,7 +244,8 @@ extern const Menu::Item_t miEditPhase,
                           miSaveProfile,
                           miPidSettingP, 
                           miPidSettingI, 
-                          miPidSettingD;
+                          miPidSettingD,
+                          miCycleStart;
 
 // ----------------------------------------------------------------------------
 // PID
@@ -336,14 +335,15 @@ bool getItemValueLabel(const Menu::Item_t *mi, char *label) {
   if (isPidSetting(mi)) {
     ftoa(label, *dValue, 2); // need greater precision with pid values
   } else if (mi == &miStartTemp || mi == &miEndTemp) {
-      itostr(label, *iValue, "\367C");
+      itostr(label, *iValue, "\367C ");
   } else if (mi == &miDuration) {
-      itostr(label, *iValue, "s");
+      itostr(label, *iValue, "s ");
   } else if (mi == &miRate) {
       ftoa(label, *dValue, 1);
   } else if (mi == &miEditPhase) {
-      itostr(label, *iValue, "");
+      itostr(label, *iValue, " ");
   }
+  
   return dValue || iValue;
 }
 
@@ -357,8 +357,6 @@ bool editNumericalValue(const Menu::Action_t action) {
 
     if (initial) {
       tft.setTextColor(ST7735_BLACK, ST7735_WHITE);
-      tft.setCursor(10, PROMPT_Y);
-      tft.print("Click to EDIT & SAVE");
       tft.setCursor(10, EXIT_Y);
       tft.print("Double click to EXIT");
       Encoder.setAccelerationEnabled(true);
@@ -458,7 +456,7 @@ bool factoryReset(const Menu::Action_t action) {
     currentState = Edit;
 
     if (initial) { // TODO: add eyecandy: colors or icons
-      tft.setTextColor(ST7735_BLACK, ST7735_WHITE);
+      tft.setTextColor(ST7735_RED, ST7735_WHITE);
       tft.setCursor(10, PROMPT_Y);
       tft.print("Click to confirm");
       tft.setCursor(10, EXIT_Y);
@@ -504,7 +502,7 @@ bool saveLoadProfile(const Menu::Action_t action) {
       tft.print("Doubleclick to exit");
     }
 
-    if (encAbsolute > maxProfiles) encAbsolute = maxProfiles;
+    if (encAbsolute >= maxProfiles) encAbsolute = maxProfiles - 1;
     if (encAbsolute <  0) encAbsolute =  0;
 
     tft.setCursor(10, PROMPT_Y);
@@ -535,22 +533,42 @@ bool saveLoadProfile(const Menu::Action_t action) {
 
 void toggleAutoTune();
 
+// ----------------------------------------------------------------------------
+
 bool cycleStart(const Menu::Action_t action) {
+  
   if (action == Menu::actionDisplay) {
-    startCycleZeroCrossTicks = zeroCrossTicks;
-    menuExit(action);
+    if (Input <= MAX_START_TEMP) {
+      startCycleZeroCrossTicks = zeroCrossTicks;
+      PID.SetMode(AUTOMATIC);
+      menuExit(action);
 
 #ifndef PIDTUNE    
-    calcProfile();
-    currentState = Phase1;
+      calcProfile();
+      currentState = Phase1;
 #else
-    toggleAutoTune();
+      toggleAutoTune();
 #endif
-    initialProcessDisplay = false;
-    menuUpdateRequest = false;
-  }
 
-  return true;
+      initialProcessDisplay = false;
+      menuUpdateRequest = false;
+    } else {
+
+      // Too hot to start a cycle
+      
+      tft.setTextColor(ST7735_WHITE, ST7735_RED);
+      tft.fillScreen(ST7735_RED);
+      tft.setCursor(10, 50);
+      tft.print("Too hot to start");
+      digitalWrite(SOUNDER, HIGH);
+      delay(100);
+      digitalWrite(SOUNDER, LOW);
+      delay(2000);
+      menuExit(Menu::actionDisplay); // reset to initial state
+      menuUpdateRequest = true;  
+    }
+  }
+  return true;      
 }
 
 // ----------------------------------------------------------------------------
@@ -816,11 +834,6 @@ void updateProcessDisplay() {
     tmp = profileDuration + DURATION_HEADROOM; // expand X scale to be slightly longer than profile
     tmp = (w * 100) / tmp; 
     pxPerS = (uint8_t)tmp;
-
-    Serial.print("profilePeak=");Serial.println(profilePeak);
-    Serial.print("profileDuration=");Serial.println(profileDuration);
-    Serial.print("pxPerC=");Serial.println(pxPerC);
-    Serial.print("pxPerS=");Serial.println(pxPerS);
     
     // 50°C grid
     int16_t t = (uint16_t)profilePeak + TEMPERATURE_HEADROOM;
@@ -864,15 +877,21 @@ void updateProcessDisplay() {
     case Phase3:
     case Phase4:
     case Phase5:
-    case CoolDown:
       tft.print(activeProfile.Phases[currentState].Name);
       break;
+    
+    case CoolDown:
+      tft.print("Cooldown");
+      break;
       
-    #define casePrintState(state) case state: tft.print(#state); break;
-    casePrintState(Complete);
-    default: tft.print((uint8_t)currentState); break;
+    case Complete:
+      tft.print("COMPLETE");
+      break;
+
+    default: 
+      tft.print(" xx ");tft.print(currentState); 
+      break;
   }
-  tft.print("        "); // lazy: fill up space
 
   tft.setTextColor(ST7735_BLACK, ST7735_WHITE);
 #endif
@@ -961,19 +980,19 @@ void setup() {
 #ifdef WITH_SPLASH
   // splash screen
   tft.fillScreen(ST7735_BLUE);
-  tft.setCursor(10, 30);
+  tft.setCursor(20, 30);
   tft.setTextSize(2);
   tft.setTextColor(ST7735_WHITE);
   tft.print("Reflow");
-  tft.setCursor(10, 48);
+  tft.setCursor(20, 48);
   tft.print("Controller");
   tft.setTextSize(1);
-  tft.setCursor(52, 67);
-  tft.print("v"); tft.print(ver);
+  tft.setCursor(35, 76);
+  tft.print("ver "); tft.print(ver);
   tft.setTextColor(ST7735_BLACK);
 
   digitalWrite(SOUNDER, HIGH);
-  delay(250);
+  delay(100);
   digitalWrite(SOUNDER, LOW);
   
   delay(2000);
@@ -1091,18 +1110,37 @@ void loop(void)
         Engine.invoke();
       }
       else if (currentState < Complete) {
-        currentState = CoolDown;
+        Setpoint = idleTemp;
         PID.SetMode(MANUAL);
         Output = 0;
+        currentState = Complete;
+      }
+      else if (currentState == Complete) {
+        PID.SetMode(MANUAL);
+        Output = 0;
+        menuExit(Menu::actionDisplay); // reset to initial state
+        Engine.navigate(&miCycleStart);
+        currentState = Settings;
+        menuUpdateRequest = true;
       }
       break;
 
     case ClickEncoder::DoubleClicked:
-      if (currentState < UIMenuEnd) {
-        if (Engine.getParent() != &miExit) {
-          Engine.navigate(Engine.getParent());
-          menuUpdateRequest = true;
-        }
+      if (currentState < Complete) {
+        Setpoint = idleTemp;
+        PID.SetMode(MANUAL);
+        Output = 0;
+        
+        menuExit(Menu::actionDisplay); // reset to initial state
+        Engine.navigate(&miCycleStart);
+        currentState = Settings;
+        menuUpdateRequest = true;
+      } 
+      else if (currentState < UIMenuEnd) {
+        Engine.navigate(Engine.getParent()); // Double click to exit back
+        menuUpdateRequest = true;
+        currentState = Settings;
+        previousState = Settings; // exit even if editing
       }
       break;
   }
@@ -1202,7 +1240,7 @@ void loop(void)
     // display update
     if (zeroCrossTicks - lastDisplayUpdate > DISPLAY_PERIOD) {
       lastDisplayUpdate = zeroCrossTicks;
-      if ((currentState < Idle) or  // Active or Tuning
+      if ((currentState < Settings) or  // Active or Tuning
           (currentState == Tune)){
         updateProcessDisplay();
       }
@@ -1221,7 +1259,7 @@ void loop(void)
       case Phase2: //Soak
       case Phase3: //Rampup
       case Phase4: //Peak
-      case Phase5: //Rampdown
+      case Phase5: //Alert
 
         if (stateChanged) {
           lastRampTicks        = zeroCrossTicks;
@@ -1232,7 +1270,7 @@ void loop(void)
           // Indicate sounder if need a rapid fall by opening the oven door
           
           if (not activeProfile.Phases[currentState].Rising &&
-              activeProfile.Phases[currentState].Rate >= 2.0) {
+              activeProfile.Phases[currentState].Rate >= 5.0) {
             digitalWrite(SOUNDER, HIGH); 
           } else {
             digitalWrite(SOUNDER, LOW); 
@@ -1268,7 +1306,11 @@ void loop(void)
           PID.SetMode(MANUAL);
           Output = 0;
         }
-      
+        break;
+
+      case Complete:
+        break;
+
 #ifdef PIDTUNE
       case Tune:
         {
@@ -1315,7 +1357,6 @@ void loop(void)
   
   PID.Compute();
   heaterValue = Output;
-
   heaterChannel.target = heaterValue;
 }
 
@@ -1467,29 +1508,35 @@ void makeDefaultProfile() {
 // ----------------------------------------------------------------------------
 
 void factoryReset() {
-#ifndef PIDTUNE
 
   tft.fillScreen(ST7735_RED);
-  tft.setTextColor(ST7735_WHITE);
+  tft.setTextColor(ST7735_WHITE, ST7735_RED);
   tft.setCursor(10, 50);
-  tft.print("Clear EEPROM...");
+  tft.print("Clear EEPROM..");
 
   for (int i = 0 ; i < EEPROM.length() ; i++) {
     EEPROM.write(i, 0);
   }
   
+#ifndef PIDTUNE
   makeDefaultProfile();
 
   tft.fillScreen(ST7735_RED);
-  tft.setTextColor(ST7735_WHITE);
   tft.setCursor(10, 50);
-  tft.print("Resetting profiles...");
-#endif
+  tft.print("Resetting profiles..");
 
   // then save the same profile settings into all slots
-  for (uint8_t i = 0; i <= maxProfiles; i++) {
+  for (uint8_t i = 0; i < maxProfiles; i++) {
     saveParameters(i);
+    tft.setCursor(10, 50);
+    tft.print("Resetting profiles.. ");
+    tft.print(i);
   }
+#endif
+
+  tft.fillScreen(ST7735_RED);
+  tft.setCursor(10, 50);
+  tft.print("Resetting PID values");
 
   heaterPID.Kp =  DEFAULT_HEATER_Kp; 
   heaterPID.Ki =  DEFAULT_HEATER_Ki;
@@ -1498,7 +1545,6 @@ void factoryReset() {
 
   activeProfileId = 0;
   saveLastUsedProfile();
-
   delay(500);
 }
 
