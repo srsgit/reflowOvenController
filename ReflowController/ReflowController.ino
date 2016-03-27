@@ -14,7 +14,7 @@
 // Arduino 328P UNO or Duemilanove
 // ----------------------------------------------------------------------------
 
-const char *ver = "SRS 0.9g";
+const char *ver = "SRS 0.9(i)";
 
 // ----------------------------------------------------------------------------
 
@@ -42,12 +42,16 @@ const char *ver = "SRS 0.9g";
 
 #define  TICK_PERIOD       10   // xx ms for zero crossing ISR
 #define  CYCLE_PERIOD      10   // TICK PERIODS
-#define  DISPLAY_PERIOD    20   // TICK PERIODS
+#define  DISPLAY_PERIOD    25   // TICK PERIODS
 
 static int ticksPerSec = 1000 / TICK_PERIOD;
 
 #define  MAX_START_TEMP    50  // maximum temperature where a new reflow session will be allowed to start
 #define  NUM_PHASES         5  // number of phases in a profile
+
+#define DEFAULT_HEATER_Kp 4.25
+#define DEFAULT_HEATER_Ki 0.25
+#define DEFAULT_HEATER_Kd 6.50
 
 // ----------------------------------------------------------------------------
 // Hardware Configuration 
@@ -87,6 +91,8 @@ volatile uint32_t timerTicks     = 0;
 volatile uint32_t zeroCrossTicks = 0;
 
 const uint8_t     maxProfiles = 4;
+uint16_t          profileDuration = 300;
+uint16_t          profilePeak     = 220;
 
 char buf[20]; // generic char buffer
 
@@ -121,9 +127,9 @@ int       idleTemp          = 50; // temperature at which to leave the oven to s
 struct ReflowPhase {
   char    Name[12];
   int     StartTemperatureC;
-  int     ExitTemperatureC;
+  int     EndTemperatureC;
   double  Rate;
-  int     ExitDurationS;
+  int     DurationS;
   boolean Rising;
   State   NextState;
 };
@@ -136,12 +142,12 @@ struct ReflowProfile {
 ReflowProfile activeProfile;
 
 ReflowProfile defaultProfile = {
-  { // Zone         Start(C)   Exit(C)   Rate    Duration,   Rising Next
-    { "Pre-heat",    50,      150,      1.0,    180,        true,  Phase2},
-    { "Soak",       150,      180,      0.6,     60,        true,  Phase3},
-    { "ReflowPeak", 225,      225,      0.0,     40,        true,  Phase4},
-    { "ReflowCool", 180,      150,      2.0,     30,        false, Phase5},
-    { "Cool",       150,       40,      1.5,    180,        false, CoolDown},
+  { // Zone         Start(C)   Exit(C)   Rate    Duration,   Rising  Next
+    { "Pre-heat",    50,      150,      1.0,    160,        true,    Phase2},
+    { "Soak",       150,      180,      0.6,     60,        true,    Phase3},
+    { "ReflowPeak", 180,      220,     10.0,     40,        true,    Phase4},
+    { "ReflowCool", 220,      180,     10.0,      4,        false,   Phase5},
+    { "Cool",       180,       50,      1.5,    120,        false,   CoolDown},
   },
   0
 };
@@ -256,8 +262,9 @@ typedef struct {
   double Kd;
 } PID_t;
 
-PID_t heaterPID = { 30.00, 0.00,  5.00 };
-
+PID_t heaterPID = {DEFAULT_HEATER_Kp,
+                   DEFAULT_HEATER_Ki,
+                   DEFAULT_HEATER_Kd};
 
 PID PID(&Input, &Output, &Setpoint, heaterPID.Kp, heaterPID.Ki, heaterPID.Kd, DIRECT);
 
@@ -300,9 +307,9 @@ void printDouble(double val, uint8_t precision = 1) {
 void getItemValuePointer(const Menu::Item_t *mi, double **d, int16_t **i) {
   if (mi == &miEditPhase)     *i = &editPhase;
   if (mi == &miStartTemp)     *i = &activeProfile.Phases[editPhase].StartTemperatureC;
-  if (mi == &miEndTemp)       *i = &activeProfile.Phases[editPhase].ExitTemperatureC;
+  if (mi == &miEndTemp)       *i = &activeProfile.Phases[editPhase].EndTemperatureC;
   if (mi == &miRate)          *d = &activeProfile.Phases[editPhase].Rate;
-  if (mi == &miDuration)      *i = &activeProfile.Phases[editPhase].ExitDurationS;
+  if (mi == &miDuration)      *i = &activeProfile.Phases[editPhase].DurationS;
   if (mi == &miPidSettingP)   *d = &heaterPID.Kp;
   if (mi == &miPidSettingI)   *d = &heaterPID.Ki;
   if (mi == &miPidSettingD)   *d = &heaterPID.Kd; 
@@ -323,7 +330,7 @@ bool isRate(const Menu::Item_t *mi) {
 bool getItemValueLabel(const Menu::Item_t *mi, char *label) {
   int16_t *iValue = NULL;
   double  *dValue = NULL;
-  
+
   getItemValuePointer(mi, &dValue, &iValue);
 
   if (isPidSetting(mi)) {
@@ -337,21 +344,23 @@ bool getItemValueLabel(const Menu::Item_t *mi, char *label) {
   } else if (mi == &miEditPhase) {
       itostr(label, *iValue, "");
   }
-
   return dValue || iValue;
 }
 
 // ----------------------------------------------------------------------------
 
 bool editNumericalValue(const Menu::Action_t action) { 
+
   if (action == Menu::actionDisplay) {
-    bool initial = currentState != Edit;
+    bool initial = (currentState != Edit);
     currentState = Edit;
 
     if (initial) {
       tft.setTextColor(ST7735_BLACK, ST7735_WHITE);
+      tft.setCursor(10, PROMPT_Y);
+      tft.print("Click to EDIT & SAVE");
       tft.setCursor(10, EXIT_Y);
-      tft.print("Edit & click to save.");
+      tft.print("Double click to EXIT");
       Encoder.setAccelerationEnabled(true);
     }
 
@@ -532,8 +541,8 @@ bool cycleStart(const Menu::Action_t action) {
     menuExit(action);
 
 #ifndef PIDTUNE    
+    calcProfile();
     currentState = Phase1;
-    Serial.println("Enter Phase 1");
 #else
     toggleAutoTune();
 #endif
@@ -655,9 +664,6 @@ typedef struct Channel_s {
 
 Channel_t heaterChannel =   { 0, 0, 0, false, PIN_HEATER }; // PD2 == Arduino Pin 2
 
-// delay to align relay activation with the actual zero crossing
-uint16_t zxLoopDelay;
-
 // ----------------------------------------------------------------------------
 // Zero Crossing ISR
 
@@ -704,15 +710,8 @@ void abortWithError(int error) {
 
   killRelayPins();
   
-#ifdef DEBUG
-  Serial.print("Abort with error = ");
-  Serial.println(error);
-#endif
-  
   tft.setTextColor(ST7735_WHITE, ST7735_RED);
-  
   tft.fillScreen(ST7735_RED);
-
   tft.setCursor(10, 10);
   
   if (error < 9) {
@@ -769,11 +768,16 @@ void alignRightPrefix(uint16_t v) {
   if (v < 1e1) tft.print(' ');
 }
 
-uint16_t pxPerS;
-uint16_t pxPerC;
+uint8_t pxPerS; // per tenths seconds
+uint8_t pxPerC; // per hundredths degree
+
 uint16_t xOffset; // used for wraparound on x axis
 
-#define FULL_X  7 * 60 // 6 minutes
+#define Y_STATUS 118 // start of botton status
+#define Y_OFFSET  36 // end of top status
+
+#define DURATION_HEADROOM 20
+#define TEMPERATURE_HEADROOM 20
 
 // ----------------------------------------------------------------------------
 // 
@@ -782,13 +786,11 @@ uint16_t xOffset; // used for wraparound on x axis
 // ----------------------------------------------------------------------------
 
 void updateProcessDisplay() {
-  const uint8_t h =  66;
-  const uint8_t w = 160;
-  const uint8_t yOffset =  30; // space not available for graph  
-
-  uint16_t dx, dy;
-  uint8_t  y = 2;
-  double   tmp;
+  const uint16_t h = Y_STATUS - Y_OFFSET - 2; 
+  const uint16_t w = 160;
+  uint16_t       dx, dy;
+  uint16_t       y = 2;
+  double         tmp;
 
   // header & initial view
   tft.setTextColor(ST7735_WHITE, ST7735_BLUE);
@@ -806,23 +808,27 @@ void updateProcessDisplay() {
     tft.print("Tuning ");
 #endif
 
-    tmp = h / ((uint16_t)activeProfile.Phases[Phase3].ExitTemperatureC * 1.20) * 100.0;
-    pxPerC = (uint16_t)tmp;
-    
-    tmp = FULL_X;
-    tmp = w / tmp * 10.0; 
-    pxPerS = (uint16_t)tmp;
+    calcProfile(); // work out duration and peak temp
 
+    tmp = (h * 100)/ ((uint8_t)profilePeak + TEMPERATURE_HEADROOM);
+    pxPerC = (uint8_t)tmp;
+    
+    tmp = profileDuration + DURATION_HEADROOM; // expand X scale to be slightly longer than profile
+    tmp = (w * 100) / tmp; 
+    pxPerS = (uint8_t)tmp;
+
+    Serial.print("profilePeak=");Serial.println(profilePeak);
+    Serial.print("profileDuration=");Serial.println(profileDuration);
+    Serial.print("pxPerC=");Serial.println(pxPerC);
+    Serial.print("pxPerS=");Serial.println(pxPerS);
+    
     // 50°C grid
-    int16_t t = (uint16_t)activeProfile.Phases[Phase3].ExitTemperatureC * 1.20; //assume Phase 3 is peak
+    int16_t t = (uint16_t)profilePeak + TEMPERATURE_HEADROOM;
     for (uint16_t tg = 0; tg < t; tg += 50) {
-      uint16_t l = h - (tg * pxPerC / 100) + yOffset;
+      uint16_t l = h - (tg * pxPerC / 100) + Y_OFFSET;
       tft.drawFastHLine(0, l, 160, tft.Color565(0xe0, 0xe0, 0xe0));
     }
-#ifdef GRAPH_VERBOSE
-
-#endif
-  }
+  } // end of first time display 
 
   // elapsed time
   uint16_t elapsed = (zeroCrossTicks - startCycleZeroCrossTicks) / ticksPerSec;
@@ -880,29 +886,28 @@ void updateProcessDisplay() {
   tft.print("\367C  ");
 
   // draw temperature curves
-  //
 
   if (xOffset >= elapsed) {
     xOffset = 0;
   }
 
   do { // x with wrap around
-    dx = ((elapsed - xOffset) * pxPerS) / 10;
+    dx = ((elapsed - xOffset) * pxPerS) / 100;
     if (dx > w) {
       xOffset = elapsed;
     }
   } while(dx > w);
 
   // temperature setpoint
-  dy = h - ((uint16_t)Setpoint * pxPerC / 100) + yOffset;
+  dy = h - ((uint16_t)Setpoint * pxPerC / 100) + Y_OFFSET;
   tft.drawPixel(dx, dy, ST7735_BLUE);
 
   // actual temperature
-  dy = h - ((uint16_t)A.temperature * pxPerC / 100) + yOffset;
+  dy = h - ((uint16_t)A.temperature * pxPerC / 100) + Y_OFFSET;
   tft.drawPixel(dx, dy, ST7735_RED);
 
   // bottom line
-  y = 118;
+  y = Y_STATUS;
 
   // set values
   tft.setCursor(10, y);
@@ -934,7 +939,7 @@ void setup() {
   
   Serial.begin(57600);
 
-  tft.initR(INITR_GREENTAB);
+  tft.initR(INITR_BLACKTAB);
   tft.setTextWrap(false);
   tft.setTextSize(1);
   tft.setRotation(1);
@@ -947,28 +952,35 @@ void setup() {
     loadLastUsedProfile();
   }
 
-  tft.fillScreen(ST7735_WHITE);
-  tft.setTextColor(ST7735_BLACK, ST7735_WHITE);
-
   Timer1.initialize(100);
   Timer1.attachInterrupt(timerIsr);
   Timer1.start();
   FlexiTimer2::set(TICK_PERIOD, 1.0/1000.0, zeroCrossingIsr);
   FlexiTimer2::start();
-  delay(100);
 
 #ifdef WITH_SPLASH
   // splash screen
+  tft.fillScreen(ST7735_BLUE);
   tft.setCursor(10, 30);
   tft.setTextSize(2);
+  tft.setTextColor(ST7735_WHITE);
   tft.print("Reflow");
   tft.setCursor(10, 48);
   tft.print("Controller");
   tft.setTextSize(1);
   tft.setCursor(52, 67);
   tft.print("v"); tft.print(ver);
+  tft.setTextColor(ST7735_BLACK);
+
+  digitalWrite(SOUNDER, HIGH);
+  delay(250);
+  digitalWrite(SOUNDER, LOW);
+  
   delay(2000);
 #endif
+
+  tft.fillScreen(ST7735_WHITE);
+  tft.setTextColor(ST7735_BLACK, ST7735_WHITE);
 
   readThermocouple(&A);
 
@@ -981,15 +993,11 @@ void setup() {
     airTemp[i].temp = A.temperature;
   }
 
-  zxLoopDelay = DEFAULT_LOOP_DELAY;
-
   loadPID();
 
   PID.SetOutputLimits(0, 100); // max output 100%
   heaterChannel.startW = zeroCrossTicks;
   PID.SetMode(AUTOMATIC);
-
-  delay(500);
 
   menuExit(Menu::actionDisplay); // reset to initial state
   Engine.navigate(&miCycleStart);
@@ -1216,9 +1224,6 @@ void loop(void)
       case Phase5: //Rampdown
 
         if (stateChanged) {
-          Serial.print("New state ");
-          Serial.println(currentState);
-          
           lastRampTicks        = zeroCrossTicks;
           stateChanged         = false;
           heaterChannel.startW = zeroCrossTicks;
@@ -1236,7 +1241,7 @@ void loop(void)
 
         updateRampSetpoint(activeProfile.Phases[currentState].Rate,
                            activeProfile.Phases[currentState].Rising,
-                           activeProfile.Phases[currentState].ExitTemperatureC);
+                           activeProfile.Phases[currentState].EndTemperatureC);
 
         // --------------------------------------------------------------------
         // check if Phase end temperature reached
@@ -1244,9 +1249,8 @@ void loop(void)
         // --------------------------------------------------------------------
 
         nextState = currentState;
-        if ((zeroCrossTicks - stateChangedTicks) >= activeProfile.Phases[currentState].ExitDurationS * ticksPerSec) {
+        if ((zeroCrossTicks - stateChangedTicks) >= activeProfile.Phases[currentState].DurationS * ticksPerSec) {
           nextState = activeProfile.Phases[currentState].NextState;
-          Serial.println("End state (time reached) ");
         }
 
         currentState = nextState;
@@ -1355,7 +1359,7 @@ void loadProfile(unsigned int targetProfile) {
     tft.print("Checksum error!");
     tft.setCursor(10, 60);
     tft.print("Review profile.");
-    delay(10000);
+    delay(5000);
   }
 
   // save in any way, as we have no undo
@@ -1370,6 +1374,8 @@ void loadProfile(unsigned int targetProfile) {
 bool saveParameters(uint8_t profile) {
 #ifndef PIDTUNE
   uint16_t offset = profile * sizeof(ReflowProfile);
+
+  calcProfile(); // fix Rising flag
 
 #ifdef WITH_CHECKSUM
    activeProfile.checksum = crc8((uint8_t *)&activeProfile, sizeof(ReflowProfile) - sizeof(uint8_t));
@@ -1392,20 +1398,28 @@ bool loadParameters(uint8_t profile) {
   } while (!(eeprom_is_ready()));
   eeprom_read_block(&activeProfile, (void *)offset, sizeof(ReflowProfile));
 
-  for (uint8_t i=0; i<NUM_PHASES; i++) {
-    activeProfile.Phases[i].Rising = true;
-    if (activeProfile.Phases[i].ExitTemperatureC < activeProfile.Phases[i].StartTemperatureC) {
-      activeProfile.Phases[i].Rising = false;
-    }
-  }
-  
+  calcProfile(); // fix Rising flag and get peak and duration
+
 #ifdef WITH_CHECKSUM
   return (activeProfile.checksum == crc8((uint8_t *)&activeProfile, sizeof(ReflowProfile) - sizeof(uint8_t)));
 #else
   return true;  
 #endif
+}
 
+// ----------------------------------------------------------------------------
 
+void calcProfile() {
+  profilePeak     = 0.0;
+  profileDuration = 0;
+  for (uint8_t i=0; i<NUM_PHASES; i++) {
+    activeProfile.Phases[i].Rising = true;
+    if (activeProfile.Phases[i].EndTemperatureC < activeProfile.Phases[i].StartTemperatureC) {
+      activeProfile.Phases[i].Rising = false;
+    }
+    profileDuration += activeProfile.Phases[i].DurationS;
+    profilePeak = (activeProfile.Phases[i].EndTemperatureC > profilePeak) ? activeProfile.Phases[i].EndTemperatureC : profilePeak;
+  }
 }
 
 // ----------------------------------------------------------------------------
@@ -1477,15 +1491,15 @@ void factoryReset() {
     saveParameters(i);
   }
 
-  heaterPID.Kp =  4.25; 
-  heaterPID.Ki =  0.25;
-  heaterPID.Kd =  6.50;
+  heaterPID.Kp =  DEFAULT_HEATER_Kp; 
+  heaterPID.Ki =  DEFAULT_HEATER_Ki;
+  heaterPID.Kd =  DEFAULT_HEATER_Kd;
   savePID();
 
   activeProfileId = 0;
   saveLastUsedProfile();
 
-  delay(1000);
+  delay(500);
 }
 
 // ----------------------------------------------------------------------------
