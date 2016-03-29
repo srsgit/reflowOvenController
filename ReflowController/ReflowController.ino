@@ -15,7 +15,7 @@
 // Arduino 328P UNO or Duemilanove
 // ----------------------------------------------------------------------------
 
-const char *ver = "SRS 0.9(k)";
+const char *ver = "SRS 0.9(m)";
 
 // ----------------------------------------------------------------------------
 
@@ -123,7 +123,7 @@ int       activeProfileId   = 0;
 int       idleTemp          = 50; // temperature at which to leave the oven to safely cool naturally
 
 struct ReflowPhase {
-  char    Name[12];
+  char    Name[10];
   int     StartTemperatureC;
   int     EndTemperatureC;
   double  Rate;
@@ -141,11 +141,12 @@ ReflowProfile activeProfile;
 
 ReflowProfile defaultProfile = {
   { // Zone         Start(C)  Exit(C)   Rate    Duration,   Rising   Next
-    { "Preheat  ",     50,      150,      1.2,    120,        true,    Phase2},
-    { "Soak     ",    150,      180,      0.8,     60,        true,    Phase3},
-    { "Ramp Up  ",    180,      210,     10.0,     45,        true,    Phase4},
-    { "Alert    ",    210,      180,     10.0,      3,        false,   Phase5},
-    { "Cool     ",    180,       50,      1.9,    150,        false,   CoolDown},
+
+    { "Preheat ",     50,      150,      1.2,    110,        true,    Phase2},
+    { "Soak    ",    150,      180,      0.5,     80,        true,    Phase3},
+    { "Ramp Up ",    180,      210,     10.0,     45,        true,    Phase4},
+    { "Alert   ",    210,      180,     10.0,      3,        false,   Phase5},
+    { "Cool    ",    180,       50,      1.5,    150,        false,   CoolDown},
   },
   0
 };
@@ -202,7 +203,6 @@ Menu::Engine     Engine;
 
 int16_t       encMovement;
 int16_t       encAbsolute;
-int16_t       encLastAbsolute       = -1;
 const uint8_t menuItemsVisible      = 8;
 const uint8_t menuItemHeight        = 14;
 bool          menuUpdateRequest     = true;
@@ -669,8 +669,6 @@ void killRelayPins(void) {
 }
 
 // ----------------------------------------------------------------------------
-// wave packet control: only turn the solid state relais on for a percentage 
-// of complete sinusoids (i.e. 1x 360°)
 
 typedef struct Channel_s {
   volatile uint8_t target; // percentage of on-time
@@ -814,11 +812,15 @@ void updateProcessDisplay() {
   tft.setTextColor(ST7735_WHITE, ST7735_BLUE);
 
   if (!initialProcessDisplay) {
+
+    // First time
+
     initialProcessDisplay = true;
 
     tft.fillScreen(ST7735_WHITE);
     tft.fillRect(0, 0, tft.width(), menuItemHeight, ST7735_BLUE);
     tft.setCursor(2, y);
+
 #ifndef PIDTUNE
     tft.print("Profile ");
     tft.print(activeProfileId);
@@ -826,7 +828,7 @@ void updateProcessDisplay() {
     tft.print("Tuning ");
 #endif
 
-    calcProfile(); // work out duration and peak temp
+    calcProfile(); // work out profile duration and peak temp
 
     tmp = (h * 100)/ ((uint8_t)profilePeak + TEMPERATURE_HEADROOM);
     pxPerC = (uint8_t)tmp;
@@ -844,29 +846,34 @@ void updateProcessDisplay() {
   } // end of first time display 
 
   // elapsed time
+
   uint16_t elapsed = (zeroCrossTicks - startCycleZeroCrossTicks) / ticksPerSec;
   tft.setCursor(125, y);
   alignRightPrefix(elapsed); 
   tft.print(elapsed);
   tft.print("s");
-
   y += menuItemHeight + 2;
 
+  // temperature
+  
   tft.setCursor(2, y);
   tft.setTextColor(ST7735_BLACK, ST7735_WHITE);
-
-  // temperature
   tft.setTextSize(2);
   alignRightPrefix((int)A.temperature);
   displayThermocoupleData(&A);
-  tft.setTextSize(1);
 
+  // log elapsed time, setpoint and actual temperature
+  
   Serial.print(","); // One column over if treated as CSV
   Serial.print(elapsed); Serial.print(", "); 
   Serial.print(Setpoint); Serial.print(", "); Serial.println(A.temperature);
+  
+  tft.setTextSize(1);
 
 #ifndef PIDTUNE
+  
   // current state
+
   y -= 2;
   tft.setCursor(95, y);
   tft.setTextColor(ST7735_BLACK, ST7735_GREEN);
@@ -888,7 +895,7 @@ void updateProcessDisplay() {
       tft.print("COMPLETE");
       break;
 
-    default: 
+    default: // shouldn't get here
       tft.print(" xx ");tft.print(currentState); 
       break;
   }
@@ -928,13 +935,16 @@ void updateProcessDisplay() {
   // bottom line
   y = Y_STATUS;
 
-  // set values
+  // heater output percentage
+  
   tft.setCursor(10, y);
   tft.print("\xef");
   alignRightPrefix((int)heaterValue); 
   tft.print((int)heaterValue);
   tft.print('%');
 
+  // actual ramp rate
+  
   tft.print("     \x12 "); // alternative: \x7f
   printDouble(rampRate);
   tft.print("\367C/s    ");
@@ -953,6 +963,7 @@ void setup() {
   pinMode(LCD_CS, OUTPUT);
   digitalWrite(LCD_CS, HIGH);
 
+  // setup Sounder output (Active High)
   pinMode(SOUNDER, OUTPUT);
   digitalWrite(SOUNDER, LOW);
   
@@ -992,10 +1003,10 @@ void setup() {
   tft.setTextColor(ST7735_BLACK);
 
   digitalWrite(SOUNDER, HIGH);
-  delay(100);
+  delay(200);
   digitalWrite(SOUNDER, LOW);
   
-  delay(2000);
+  delay(5000);
 #endif
 
   tft.fillScreen(ST7735_WHITE);
@@ -1035,6 +1046,9 @@ void setup() {
     i = (i + 1) % 8; // next position
     average = total >> 3; // == div by 8 */
 // ----------------------------------------------------------------------------
+
+// ----------------------------------------------------------------------------
+// Calculate next setpoint temperature for a ramp phase
 
 uint32_t lastRampTicks;
 
@@ -1207,7 +1221,7 @@ void loop(void)
     }
 
     // ------------------------------------------------------------------------
-    // rolling average of the temp T1 and T2
+    // rolling average of the temp
     // ------------------------------------------------------------------------
 
     totalT1           -= readingsT1[index];         // subtract the last reading
